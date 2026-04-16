@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader
 
@@ -46,7 +47,21 @@ def set_seed(seed: int) -> None:
 
 
 def _get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+
+    # Some Kaggle images can expose CUDA while shipping a torch build
+    # that does not include kernels for the allocated GPU architecture.
+    try:
+        x = torch.randn(1, 3, 16, 16, device="cuda")
+        w = torch.randn(4, 3, 3, 3, device="cuda")
+        _ = F.conv2d(x, w, padding=1)
+        torch.cuda.synchronize()
+        return torch.device("cuda")
+    except Exception as exc:
+        print("CUDA is available but not runtime-compatible with this torch build.")
+        print(f"Falling back to CPU. Details: {exc}")
+        return torch.device("cpu")
 
 
 def _validate_columns(
@@ -83,8 +98,8 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
     print(f"Device: {device.type.upper()}")
     print(f"Output directory: {output_dir.resolve()}")
 
-    train_df = pd.read_csv(config.train_metadata_path)
-    test_df = pd.read_csv(config.test_metadata_path)
+    train_df = pd.read_csv(config.train_metadata_path, low_memory=False)
+    test_df = pd.read_csv(config.test_metadata_path, low_memory=False)
     sample_submission = pd.read_csv(config.sample_submission_path)
 
     _validate_columns(config, train_df, test_df)

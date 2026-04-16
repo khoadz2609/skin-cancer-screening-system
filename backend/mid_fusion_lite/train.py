@@ -1,13 +1,30 @@
 from __future__ import annotations
 
 import copy
-from typing import Optional
+from contextlib import nullcontext
+from typing import Any, Optional
 
 import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score
 from torch import nn
 from torch.utils.data import DataLoader
+
+
+def _autocast_context(device: torch.device, use_amp: bool):
+    if use_amp and device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
+
+
+def _build_grad_scaler(use_amp: bool):
+    try:
+        return torch.amp.GradScaler(device="cuda", enabled=use_amp)
+    except Exception:
+        try:
+            return torch.amp.GradScaler("cuda", enabled=use_amp)
+        except Exception:
+            return torch.cuda.amp.GradScaler(enabled=use_amp)
 
 
 def partial_auc_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -43,7 +60,7 @@ def train_one_epoch(
     criterion: nn.Module,
     device: torch.device,
     use_amp: bool,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: Any,
     max_steps: Optional[int] = None,
 ) -> float:
     model.train()
@@ -57,7 +74,7 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast(device_type=device.type, enabled=use_amp):
+        with _autocast_context(device=device, use_amp=use_amp):
             logits = model(images, tabular)
             loss = criterion(logits, targets)
 
@@ -98,7 +115,7 @@ def evaluate(
         tabular = batch["tabular"].to(device, non_blocking=True)
         y = batch["target"].to(device, non_blocking=True)
 
-        with torch.autocast(device_type=device.type, enabled=use_amp):
+        with _autocast_context(device=device, use_amp=use_amp):
             logits = model(images, tabular)
             loss = criterion(logits, y)
 
@@ -156,7 +173,7 @@ def predict_loader(
         images = batch["image"].to(device, non_blocking=True)
         tabular = batch["tabular"].to(device, non_blocking=True)
 
-        with torch.autocast(device_type=device.type, enabled=use_amp):
+        with _autocast_context(device=device, use_amp=use_amp):
             logits = model(images, tabular)
 
         prob = torch.sigmoid(logits)
@@ -181,8 +198,9 @@ def fit_one_fold(
     max_train_steps_per_epoch: Optional[int] = None,
     max_valid_steps: Optional[int] = None,
 ) -> tuple[dict[str, torch.Tensor], list[dict[str, float]], float]:
+    use_amp = bool(use_amp and device.type == "cuda")
     criterion = _build_criterion(pos_weight=pos_weight, device=device)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = _build_grad_scaler(use_amp=use_amp)
 
     best_score = -np.inf
     best_state = copy.deepcopy(model.state_dict())

@@ -41,14 +41,15 @@ class MidFusionLiteModel(nn.Module):
             num_classes=0,
             global_pool="avg",
         )
-        image_dim = int(self.image_encoder.num_features)
 
         if not train_image_backbone:
             for parameter in self.image_encoder.parameters():
                 parameter.requires_grad = False
 
         self.image_head = nn.Sequential(
-            nn.Linear(image_dim, fusion_hidden_dim),
+            # LazyLinear infers the true backbone output width at first forward pass.
+            # This avoids shape mismatches across timm backbones (e.g. MobileNetV3).
+            nn.LazyLinear(fusion_hidden_dim),
             nn.GELU(),
             nn.Dropout(fusion_dropout),
         )
@@ -69,6 +70,8 @@ class MidFusionLiteModel(nn.Module):
 
     def forward(self, images: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:
         image_features = self.image_encoder(images)
+        if image_features.ndim > 2:
+            image_features = torch.flatten(image_features, 1)
         image_features = self.image_head(image_features)
 
         tabular_features = self.tabular_encoder(tabular)
