@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import timm
 import torch
 from torch import nn
@@ -33,13 +35,14 @@ class MidFusionLiteModel(nn.Module):
         tab_dropout: float,
         fusion_dropout: float,
         train_image_backbone: bool = False,
+        use_pretrained_backbone: bool = False,
+        backbone_weights_path: str | None = None,
     ) -> None:
         super().__init__()
-        self.image_encoder = timm.create_model(
-            backbone_name,
-            pretrained=True,
-            num_classes=0,
-            global_pool="avg",
+        self.image_encoder = self._build_image_encoder(
+            backbone_name=backbone_name,
+            use_pretrained_backbone=use_pretrained_backbone,
+            backbone_weights_path=backbone_weights_path,
         )
 
         if not train_image_backbone:
@@ -66,6 +69,76 @@ class MidFusionLiteModel(nn.Module):
             nn.GELU(),
             nn.Dropout(fusion_dropout),
             nn.Linear(fusion_hidden_dim, 1),
+        )
+
+    @staticmethod
+    def _build_image_encoder(
+        backbone_name: str,
+        use_pretrained_backbone: bool,
+        backbone_weights_path: str | None,
+    ) -> nn.Module:
+        create_kwargs = {
+            "model_name": backbone_name,
+            "num_classes": 0,
+            "global_pool": "avg",
+        }
+
+        encoder = timm.create_model(pretrained=False, **create_kwargs)
+
+        if backbone_weights_path:
+            MidFusionLiteModel._load_backbone_weights(
+                encoder=encoder,
+                weights_path=backbone_weights_path,
+            )
+            return encoder
+
+        if not use_pretrained_backbone:
+            return encoder
+
+        try:
+            return timm.create_model(pretrained=True, **create_kwargs)
+        except Exception as exc:
+            print(
+                "Warning: failed to download pretrained weights. "
+                "Falling back to pretrained=False."
+            )
+            print(f"Details: {exc}")
+            return encoder
+
+    @staticmethod
+    def _load_backbone_weights(encoder: nn.Module, weights_path: str) -> None:
+        path = Path(weights_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Backbone weights file not found: {weights_path}")
+
+        raw_obj = torch.load(path, map_location="cpu")
+        if isinstance(raw_obj, dict):
+            if "state_dict" in raw_obj and isinstance(raw_obj["state_dict"], dict):
+                state_dict = raw_obj["state_dict"]
+            elif "model" in raw_obj and isinstance(raw_obj["model"], dict):
+                state_dict = raw_obj["model"]
+            else:
+                state_dict = raw_obj
+        else:
+            raise ValueError(
+                "Unsupported checkpoint format. Expected a dict-like state_dict."
+            )
+
+        normalized: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("module."):
+                key = key[len("module.") :]
+            if key.startswith("image_encoder."):
+                key = key[len("image_encoder.") :]
+            if key.startswith("model."):
+                key = key[len("model.") :]
+            normalized[key] = value
+
+        missing, unexpected = encoder.load_state_dict(normalized, strict=False)
+        print(
+            "Loaded local backbone weights:",
+            path,
+            f"| missing={len(missing)} | unexpected={len(unexpected)}",
         )
 
     def forward(self, images: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:

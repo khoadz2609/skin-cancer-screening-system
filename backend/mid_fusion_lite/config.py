@@ -81,6 +81,7 @@ class MidFusionLiteConfig:
     tab_dropout: float = 0.1
     fusion_dropout: float = 0.2
     train_image_backbone: bool = False
+    use_pretrained_backbone: bool = False
 
     use_amp: bool = True
     max_train_steps_per_epoch: Optional[int] = None
@@ -88,6 +89,7 @@ class MidFusionLiteConfig:
 
     save_checkpoints: bool = True
     output_dir: str = "./mid_fusion_lite_outputs"
+    backbone_weights_path: Optional[str] = None
 
     train_metadata_path: Optional[str] = None
     test_metadata_path: Optional[str] = None
@@ -203,6 +205,7 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             tab_hidden_dim=96,
             fusion_hidden_dim=128,
             train_image_backbone=False,
+            use_pretrained_backbone=False,
             max_train_steps_per_epoch=80,
             max_valid_steps=40,
             output_dir="./mid_fusion_lite_outputs/smoke",
@@ -227,6 +230,7 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             tab_dropout=0.15,
             fusion_dropout=0.25,
             train_image_backbone=True,
+            use_pretrained_backbone=False,
             max_train_steps_per_epoch=None,
             max_valid_steps=None,
             output_dir="./mid_fusion_lite_outputs/full_lite",
@@ -253,6 +257,7 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
         tab_dropout=0.1,
         fusion_dropout=0.2,
         train_image_backbone=False,
+        use_pretrained_backbone=False,
         max_train_steps_per_epoch=180,
         max_valid_steps=80,
         output_dir="./mid_fusion_lite_outputs/quick",

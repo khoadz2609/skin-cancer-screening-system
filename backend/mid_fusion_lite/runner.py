@@ -6,6 +6,9 @@ import random
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("ALBUMENTATIONS_DISABLE_VERSION_CHECK", "1")
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+
 import numpy as np
 import pandas as pd
 import torch
@@ -226,6 +229,8 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             tab_dropout=config.tab_dropout,
             fusion_dropout=config.fusion_dropout,
             train_image_backbone=config.train_image_backbone,
+            use_pretrained_backbone=config.use_pretrained_backbone,
+            backbone_weights_path=config.backbone_weights_path,
         ).to(device)
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -365,6 +370,7 @@ def main() -> None:
         "--preset", default="quick", choices=["smoke", "quick", "full_lite"]
     )
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--backbone-weights-path", default=None)
     parser.add_argument(
         "--folds", default=None, help="Comma-separated fold ids, e.g. 0,1"
     )
@@ -378,6 +384,8 @@ def main() -> None:
     updates = {}
     if args.output_dir is not None:
         updates["output_dir"] = args.output_dir
+    if args.backbone_weights_path is not None:
+        updates["backbone_weights_path"] = args.backbone_weights_path
     if args.folds is not None:
         updates["fold_indices"] = [
             int(x.strip()) for x in args.folds.split(",") if x.strip()
