@@ -51,7 +51,7 @@ class MidFusionLiteModel(nn.Module):
 
         self.image_head = nn.Sequential(
             # LazyLinear infers the true backbone output width at first forward pass.
-            # This avoids shape mismatches across timm backbones (e.g. MobileNetV3).
+            # This avoids shape mismatches across timm backbones.
             nn.LazyLinear(fusion_hidden_dim),
             nn.GELU(),
             nn.Dropout(fusion_dropout),

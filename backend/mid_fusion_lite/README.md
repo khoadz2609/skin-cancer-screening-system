@@ -1,7 +1,7 @@
 # Mid Fusion Lite (Kaggle-first)
 
 This folder contains a self-contained multimodal pipeline for ISIC 2024:
-- image branch (light timm backbone)
+- image branch (EfficientNet-B0 via timm)
 - tabular branch (scaled numeric + one-hot categorical)
 - mid-fusion head
 
@@ -18,9 +18,9 @@ It is designed for quick experiments on Kaggle with lightweight presets.
 
 ## Presets
 
-- `smoke`: 1 fold only, very fast sanity run
-- `quick`: 3 folds, lightweight model for rapid validation
-- `full_lite`: 5 folds, still lightweight but stronger than quick
+- `smoke`: 1 fold only, very fast sanity run (EfficientNet-B0)
+- `quick`: 3 folds, lightweight model for rapid validation (EfficientNet-B0)
+- `full_lite`: 5 folds, still lightweight but stronger than quick (EfficientNet-B0)
 
 ## Kaggle usage (Notebook)
 
