@@ -11,6 +11,11 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 
+def _state_dict_to_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
+    state = model.state_dict()
+    return {key: value.detach().cpu().clone() for key, value in state.items()}
+
+
 def _autocast_context(device: torch.device, use_amp: bool):
     if use_amp and device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -203,7 +208,7 @@ def fit_one_fold(
     scaler = _build_grad_scaler(use_amp=use_amp)
 
     best_score = -np.inf
-    best_state = copy.deepcopy(model.state_dict())
+    best_state = _state_dict_to_cpu(model)
     bad_epochs = 0
     history: list[dict[str, float]] = []
 
@@ -255,7 +260,7 @@ def fit_one_fold(
 
         if valid_pauc > best_score:
             best_score = valid_pauc
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = _state_dict_to_cpu(model)
             bad_epochs = 0
         else:
             bad_epochs += 1

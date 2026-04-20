@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_NUMERIC_COLS = [
+BASE_NUMERIC_COLS = [
     "age_approx",
     "clin_size_long_diam_mm",
     "tbp_lv_A",
@@ -41,6 +42,51 @@ DEFAULT_NUMERIC_COLS = [
     "tbp_lv_z",
 ]
 
+ENGINEERED_NUMERIC_COLS = [
+    "lesion_size_ratio",
+    "lesion_shape_index",
+    "hue_contrast",
+    "luminance_contrast",
+    "lesion_color_difference",
+    "border_complexity",
+    "color_uniformity",
+    "position_distance_3d",
+    "perimeter_to_area_ratio",
+    "area_to_perimeter_ratio",
+    "lesion_visibility_score",
+    "symmetry_border_consistency",
+    "consistency_symmetry_border",
+    "color_consistency",
+    "consistency_color",
+    "size_age_interaction",
+    "hue_color_std_interaction",
+    "lesion_severity_index",
+    "shape_complexity_index",
+    "color_contrast_index",
+    "log_lesion_area",
+    "normalized_lesion_size",
+    "mean_hue_difference",
+    "std_dev_contrast",
+    "color_shape_composite_index",
+    "lesion_orientation_3d",
+    "overall_color_difference",
+    "symmetry_perimeter_interaction",
+    "comprehensive_lesion_index",
+    "color_variance_ratio",
+    "border_color_interaction",
+    "border_color_interaction_2",
+    "size_color_contrast_ratio",
+    "age_normalized_nevi_confidence",
+    "age_normalized_nevi_confidence_2",
+    "color_asymmetry_index",
+    "volume_approximation_3d",
+    "color_range",
+    "shape_color_consistency",
+    "border_length_ratio",
+    "age_size_symmetry_index",
+    "index_age_size_symmetry",
+]
+
 DEFAULT_CATEGORICAL_COLS = [
     "sex",
     "anatom_site_general",
@@ -49,6 +95,20 @@ DEFAULT_CATEGORICAL_COLS = [
     "tbp_lv_location_simple",
     "attribution",
 ]
+
+DEFAULT_NUMERIC_COLS = (
+    list(BASE_NUMERIC_COLS)
+    + list(ENGINEERED_NUMERIC_COLS)
+    + [f"{col}_patient_norm" for col in (BASE_NUMERIC_COLS + ENGINEERED_NUMERIC_COLS)]
+    + ["count_per_patient"]
+    + [f"{col}_count" for col in DEFAULT_CATEGORICAL_COLS]
+    + [
+        f"{num_col}_{cat_col}"
+        for num_col, cat_col in itertools.product(
+            BASE_NUMERIC_COLS, DEFAULT_CATEGORICAL_COLS
+        )
+    ]
+)
 
 
 @dataclass(frozen=True)
@@ -76,7 +136,15 @@ class MidFusionLiteConfig:
     negative_ratio: int = 6
 
     backbone_name: str = "efficientnet_b0"
+    use_feature_engineering: bool = True
+    use_tabm_tabular: bool = True
+    use_quantile_transform: bool = True
+    quantile_noise_std: float = 1e-5
     tab_hidden_dim: int = 128
+    tabm_arch_type: str = "tabm"
+    tabm_k: int = 16
+    tabm_n_blocks: int = 3
+    tabm_d_block: int = 256
     fusion_hidden_dim: int = 256
     tab_dropout: float = 0.1
     fusion_dropout: float = 0.2
@@ -84,6 +152,8 @@ class MidFusionLiteConfig:
     use_pretrained_backbone: bool = False
 
     use_amp: bool = True
+    use_data_parallel: bool = True
+    data_parallel_device_ids: Optional[list[int]] = None
     max_train_steps_per_epoch: Optional[int] = None
     max_valid_steps: Optional[int] = None
 

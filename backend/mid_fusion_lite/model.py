@@ -6,6 +6,11 @@ import timm
 import torch
 from torch import nn
 
+try:
+    from tabm import TabM
+except ImportError:
+    TabM = None
+
 
 class TabularEncoder(nn.Module):
     def __init__(self, in_features: int, hidden_dim: int, dropout: float) -> None:
@@ -25,12 +30,62 @@ class TabularEncoder(nn.Module):
         return self.net(x)
 
 
+class TabMTabularEncoder(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        hidden_dim: int,
+        dropout: float,
+        arch_type: str,
+        k: int,
+        n_blocks: int,
+        d_block: int,
+    ) -> None:
+        super().__init__()
+
+        if TabM is None:
+            raise ImportError(
+                "TABM encoder requires package 'tabm'. "
+                "Install dependencies with: pip install tabm rtdl_num_embeddings"
+            )
+
+        self.encoder = TabM.make(
+            n_num_features=in_features,
+            d_out=hidden_dim,
+            arch_type=arch_type,
+            k=k,
+            n_blocks=n_blocks,
+            d_block=d_block,
+            dropout=dropout,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.encoder(x)
+
+        if isinstance(features, tuple):
+            features = features[0]
+
+        # TabM can return (B, k, d_out); use mean over ensemble axis for fusion.
+        if features.ndim == 3:
+            return features.mean(dim=1)
+
+        if features.ndim == 2:
+            return features
+
+        raise RuntimeError(f"Unexpected TABM output shape: {tuple(features.shape)}")
+
+
 class MidFusionLiteModel(nn.Module):
     def __init__(
         self,
         backbone_name: str,
         n_tab_features: int,
+        use_tabm_tabular: bool,
         tab_hidden_dim: int,
+        tabm_arch_type: str,
+        tabm_k: int,
+        tabm_n_blocks: int,
+        tabm_d_block: int,
         fusion_hidden_dim: int,
         tab_dropout: float,
         fusion_dropout: float,
@@ -57,11 +112,22 @@ class MidFusionLiteModel(nn.Module):
             nn.Dropout(fusion_dropout),
         )
 
-        self.tabular_encoder = TabularEncoder(
-            in_features=n_tab_features,
-            hidden_dim=tab_hidden_dim,
-            dropout=tab_dropout,
-        )
+        if use_tabm_tabular:
+            self.tabular_encoder = TabMTabularEncoder(
+                in_features=n_tab_features,
+                hidden_dim=tab_hidden_dim,
+                dropout=tab_dropout,
+                arch_type=tabm_arch_type,
+                k=tabm_k,
+                n_blocks=tabm_n_blocks,
+                d_block=tabm_d_block,
+            )
+        else:
+            self.tabular_encoder = TabularEncoder(
+                in_features=n_tab_features,
+                hidden_dim=tab_hidden_dim,
+                dropout=tab_dropout,
+            )
 
         self.fusion_head = nn.Sequential(
             nn.Linear(fusion_hidden_dim + tab_hidden_dim, fusion_hidden_dim),

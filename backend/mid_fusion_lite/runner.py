@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import random
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any
 
@@ -17,19 +19,37 @@ from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader
 
 try:
-    from .config import MidFusionLiteConfig, get_preset_config, resolve_data_paths
+    from .config import (
+        BASE_NUMERIC_COLS,
+        MidFusionLiteConfig,
+        get_preset_config,
+        resolve_data_paths,
+    )
     from .data import (
         HDF5ImageTabularDataset,
         get_image_transforms,
         make_balanced_sampler,
     )
     from .model import MidFusionLiteModel
-    from .tabular import FoldTabularPreprocessor, select_available_columns
+    from .tabular import (
+        FoldTabularPreprocessor,
+        add_feature_engineering,
+        select_available_columns,
+    )
     from .train import fit_one_fold, partial_auc_score, predict_loader
 except ImportError:
-    from config import MidFusionLiteConfig, get_preset_config, resolve_data_paths
+    from config import (
+        BASE_NUMERIC_COLS,
+        MidFusionLiteConfig,
+        get_preset_config,
+        resolve_data_paths,
+    )
     from model import MidFusionLiteModel
-    from tabular import FoldTabularPreprocessor, select_available_columns
+    from tabular import (
+        FoldTabularPreprocessor,
+        add_feature_engineering,
+        select_available_columns,
+    )
     from train import fit_one_fold, partial_auc_score, predict_loader
 
     from data import (
@@ -67,6 +87,76 @@ def _get_device() -> torch.device:
         return torch.device("cpu")
 
 
+def _wrap_model_for_multi_gpu(
+    model: torch.nn.Module,
+    config: MidFusionLiteConfig,
+    device: torch.device,
+) -> torch.nn.Module:
+    if device.type != "cuda":
+        return model
+
+    if not bool(config.use_data_parallel):
+        return model
+
+    n_gpus = torch.cuda.device_count()
+    if n_gpus < 2:
+        return model
+
+    if config.data_parallel_device_ids is None:
+        device_ids = list(range(n_gpus))
+    else:
+        parsed_ids = [int(idx) for idx in config.data_parallel_device_ids]
+        device_ids = [idx for idx in parsed_ids if 0 <= idx < n_gpus]
+        if len(device_ids) < 2:
+            print(
+                "DataParallel requested but fewer than 2 valid GPU ids were provided. "
+                "Falling back to single GPU."
+            )
+            return model
+
+    print(f"Using DataParallel on GPUs: {device_ids}")
+    return torch.nn.DataParallel(model, device_ids=device_ids)
+
+
+def _initialize_lazy_parameters(
+    model: torch.nn.Module,
+    device: torch.device,
+    image_size: int,
+    n_tab_features: int,
+) -> None:
+    # DataParallel cannot replicate modules that still contain
+    # UninitializedParameter (for example nn.LazyLinear).
+    has_uninitialized = any(
+        isinstance(param, torch.nn.parameter.UninitializedParameter)
+        for param in model.parameters()
+    )
+    if not has_uninitialized:
+        return
+
+    batch_size = 2
+    was_training = model.training
+    model.eval()
+    # inference_mode marks created tensors as inference tensors, which can
+    # break autograd later when these parameters are used for training.
+    with torch.no_grad():
+        dummy_images = torch.zeros(
+            batch_size,
+            3,
+            int(image_size),
+            int(image_size),
+            device=device,
+        )
+        dummy_tabular = torch.zeros(
+            batch_size,
+            int(n_tab_features),
+            device=device,
+        )
+        _ = model(dummy_images, dummy_tabular)
+
+    if was_training:
+        model.train()
+
+
 def _validate_columns(
     config: MidFusionLiteConfig, train_df: pd.DataFrame, test_df: pd.DataFrame
 ) -> None:
@@ -90,8 +180,53 @@ def _ensure_output_dir(path: str) -> Path:
     return output_dir
 
 
+def _read_csv_with_fallback(path: str, requested_cols: set[str]) -> pd.DataFrame:
+    header_cols = list(pd.read_csv(path, nrows=0).columns)
+    selected_cols = [col for col in header_cols if col in requested_cols]
+
+    read_kwargs: dict[str, Any] = {"low_memory": True}
+    if selected_cols:
+        read_kwargs["usecols"] = selected_cols
+
+    try:
+        return pd.read_csv(path, **read_kwargs)
+    except pd.errors.ParserError as exc:
+        if "out of memory" not in str(exc).lower():
+            raise
+        print(
+            f"Parser out-of-memory while reading {path}. "
+            "Retrying with python engine."
+        )
+        retry_kwargs = dict(read_kwargs)
+        retry_kwargs["engine"] = "python"
+        return pd.read_csv(path, **retry_kwargs)
+
+
+def _filter_supported_config_updates(
+    config: MidFusionLiteConfig,
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    if not updates:
+        return updates
+
+    supported_keys = {field.name for field in dataclass_fields(type(config))}
+    filtered = {k: v for k, v in updates.items() if k in supported_keys}
+    dropped = sorted(set(updates) - set(filtered))
+    if dropped:
+        print("Ignoring unsupported config overrides: " + ", ".join(dropped))
+    return filtered
+
+
 def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
     config = resolve_data_paths(config)
+
+    if config.backbone_weights_path and not Path(config.backbone_weights_path).exists():
+        print(
+            "Backbone weights path does not exist on this machine. "
+            "Ignoring backbone_weights_path and using default backbone init."
+        )
+        config = config.with_updates(backbone_weights_path=None)
+
     set_seed(config.seed)
     device = _get_device()
 
@@ -99,13 +234,57 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
 
     print(f"Running preset: {config.preset_name}")
     print(f"Device: {device.type.upper()}")
+    if device.type == "cuda":
+        print(f"CUDA device count: {torch.cuda.device_count()}")
     print(f"Output directory: {output_dir.resolve()}")
 
-    train_df = pd.read_csv(config.train_metadata_path, low_memory=False)
-    test_df = pd.read_csv(config.test_metadata_path, low_memory=False)
+    requested_numeric_cols = set(config.numeric_cols)
+    if bool(config.use_feature_engineering):
+        requested_numeric_cols.update(BASE_NUMERIC_COLS)
+
+    requested_train_cols = {
+        config.id_col,
+        config.target_col,
+        config.group_col,
+        *config.categorical_cols,
+        *requested_numeric_cols,
+    }
+    requested_test_cols = {
+        config.id_col,
+        *config.categorical_cols,
+        *requested_numeric_cols,
+    }
+    if bool(config.use_feature_engineering):
+        requested_test_cols.add(config.group_col)
+
+    train_df = _read_csv_with_fallback(
+        path=config.train_metadata_path,
+        requested_cols=requested_train_cols,
+    )
+    test_df = _read_csv_with_fallback(
+        path=config.test_metadata_path,
+        requested_cols=requested_test_cols,
+    )
     sample_submission = pd.read_csv(config.sample_submission_path)
 
     _validate_columns(config, train_df, test_df)
+
+    if bool(config.use_feature_engineering):
+        try:
+            train_df, test_df = add_feature_engineering(
+                train_df=train_df,
+                test_df=test_df,
+                group_col=config.group_col,
+                categorical_cols=config.categorical_cols,
+            )
+        except MemoryError:
+            print(
+                "MemoryError during feature engineering. "
+                "Retrying without heavy engineered features."
+            )
+            gc.collect()
+    else:
+        print("Skipping heavy feature engineering (use_feature_engineering=False).")
 
     numeric_cols, categorical_cols = select_available_columns(
         train_df=train_df,
@@ -157,6 +336,11 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
         preprocessor = FoldTabularPreprocessor(
             numeric_cols=numeric_cols,
             categorical_cols=categorical_cols,
+            use_quantile_transform=(
+                bool(config.use_quantile_transform) and bool(config.use_tabm_tabular)
+            ),
+            quantile_noise_std=float(config.quantile_noise_std),
+            quantile_random_state=config.seed + fold_index + 1,
         )
         preprocessor.fit(fold_train_df)
 
@@ -224,14 +408,27 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
         model = MidFusionLiteModel(
             backbone_name=config.backbone_name,
             n_tab_features=x_train.shape[1],
+            use_tabm_tabular=config.use_tabm_tabular,
             tab_hidden_dim=config.tab_hidden_dim,
+            tabm_arch_type=config.tabm_arch_type,
+            tabm_k=config.tabm_k,
+            tabm_n_blocks=config.tabm_n_blocks,
+            tabm_d_block=config.tabm_d_block,
             fusion_hidden_dim=config.fusion_hidden_dim,
             tab_dropout=config.tab_dropout,
             fusion_dropout=config.fusion_dropout,
             train_image_backbone=config.train_image_backbone,
             use_pretrained_backbone=config.use_pretrained_backbone,
             backbone_weights_path=config.backbone_weights_path,
-        ).to(device)
+        )
+        model = model.to(device)
+        _initialize_lazy_parameters(
+            model=model,
+            device=device,
+            image_size=config.image_size,
+            n_tab_features=x_train.shape[1],
+        )
+        model = _wrap_model_for_multi_gpu(model=model, config=config, device=device)
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
@@ -358,7 +555,9 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
 def run_with_preset(preset_name: str = "quick", **override_kwargs) -> dict[str, Any]:
     config = get_preset_config(preset_name)
     if override_kwargs:
-        config = config.with_updates(**override_kwargs)
+        filtered_updates = _filter_supported_config_updates(config, override_kwargs)
+        if filtered_updates:
+            config = config.with_updates(**filtered_updates)
     return run_mid_fusion_cv(config)
 
 
@@ -376,6 +575,17 @@ def main() -> None:
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument(
+        "--use-data-parallel",
+        default=None,
+        choices=["true", "false"],
+        help="Enable torch.nn.DataParallel across multiple GPUs",
+    )
+    parser.add_argument(
+        "--dp-device-ids",
+        default=None,
+        help="Comma-separated CUDA ids for DataParallel, e.g. 0,1",
+    )
 
     args = parser.parse_args()
 
@@ -394,9 +604,17 @@ def main() -> None:
         updates["epochs"] = args.epochs
     if args.image_size is not None:
         updates["image_size"] = args.image_size
+    if args.use_data_parallel is not None:
+        updates["use_data_parallel"] = args.use_data_parallel == "true"
+    if args.dp_device_ids is not None:
+        updates["data_parallel_device_ids"] = [
+            int(x.strip()) for x in args.dp_device_ids.split(",") if x.strip()
+        ]
 
     if updates:
-        config = config.with_updates(**updates)
+        filtered_updates = _filter_supported_config_updates(config, updates)
+        if filtered_updates:
+            config = config.with_updates(**filtered_updates)
 
     run_mid_fusion_cv(config)
 

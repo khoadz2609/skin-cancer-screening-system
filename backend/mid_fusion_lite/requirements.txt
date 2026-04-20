@@ -3,6 +3,8 @@ pandas
 scikit-learn
 torch
 timm
+tabm
+rtdl_num_embeddings
 albumentations
 h5py
 Pillow
