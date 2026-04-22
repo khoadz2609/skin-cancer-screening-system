@@ -462,18 +462,32 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
         )
 
         model.load_state_dict(best_state)
+        predict_log_interval = max(1, int(config.predict_log_interval))
+        if bool(config.show_predict_progress):
+            print(
+                f"Running fold {fold_index + 1} inference "
+                f"(log every {predict_log_interval} steps)..."
+            )
 
         valid_pred = predict_loader(
             model=model,
             loader=valid_loader,
             device=device,
             use_amp=(config.use_amp and device.type == "cuda"),
+            progress_name=f"fold{fold_index + 1}-valid",
+            log_interval=(
+                predict_log_interval if bool(config.show_predict_progress) else 0
+            ),
         )
         test_fold_pred = predict_loader(
             model=model,
             loader=test_loader,
             device=device,
             use_amp=(config.use_amp and device.type == "cuda"),
+            progress_name=f"fold{fold_index + 1}-test",
+            log_interval=(
+                predict_log_interval if bool(config.show_predict_progress) else 0
+            ),
         )
 
         fold_pauc = partial_auc_score(y_valid, valid_pred)

@@ -156,6 +156,8 @@ class MidFusionLiteConfig:
     data_parallel_device_ids: Optional[list[int]] = None
     max_train_steps_per_epoch: Optional[int] = None
     max_valid_steps: Optional[int] = None
+    show_predict_progress: bool = True
+    predict_log_interval: int = 20
 
     save_checkpoints: bool = True
     output_dir: str = "./mid_fusion_lite_outputs"

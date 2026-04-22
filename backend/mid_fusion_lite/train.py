@@ -170,11 +170,14 @@ def predict_loader(
     loader: DataLoader,
     device: torch.device,
     use_amp: bool,
+    progress_name: Optional[str] = None,
+    log_interval: int = 0,
 ) -> np.ndarray:
     model.eval()
     predictions = []
+    total_steps = len(loader)
 
-    for batch in loader:
+    for step, batch in enumerate(loader, start=1):
         images = batch["image"].to(device, non_blocking=True)
         tabular = batch["tabular"].to(device, non_blocking=True)
 
@@ -183,6 +186,10 @@ def predict_loader(
 
         prob = torch.sigmoid(logits)
         predictions.append(prob.detach().cpu().numpy())
+
+        if progress_name and log_interval > 0:
+            if step == 1 or step % log_interval == 0 or step == total_steps:
+                print(f"[{progress_name}] predict step {step}/{total_steps}")
 
     if not predictions:
         return np.array([], dtype=np.float32)
