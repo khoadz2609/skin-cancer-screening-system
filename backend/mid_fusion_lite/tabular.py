@@ -188,11 +188,13 @@ def _add_engineered_columns(
     )
 
     if group_col in out.columns:
-        out[group_col] = out[group_col].fillna("UNK").astype(str).astype("category")
+        out[group_col] = (
+            out[group_col].astype("object").fillna("UNK").astype(str).astype("category")
+        )
 
     for col in categorical_cols:
         if col in out.columns:
-            out[col] = out[col].fillna("UNK").astype(str).astype("category")
+            out[col] = out[col].astype("object").fillna("UNK").astype(str).astype("category")
 
     generated_features: dict[str, pd.Series] = {}
     patient_grouped = out.groupby(group_col, observed=False, sort=False)
@@ -319,7 +321,7 @@ class FoldTabularPreprocessor:
 
         if self.categorical_cols:
             cat_frame = df[self.categorical_cols].copy()
-            cat_frame = cat_frame.fillna("UNK").astype(str)
+            cat_frame = cat_frame.astype("object").fillna("UNK").astype(str)
             cat_encoded = self.encoder.transform(cat_frame).astype(np.float32)
             chunks.append(cat_encoded)
 
@@ -342,7 +344,7 @@ class FoldTabularPreprocessor:
 
         if self.categorical_cols:
             cat_frame = df[self.categorical_cols].copy()
-            cat_frame = cat_frame.fillna("UNK").astype(str)
+            cat_frame = cat_frame.astype("object").fillna("UNK").astype(str)
             self.encoder.fit(cat_frame)
 
         if self.use_quantile_transform:

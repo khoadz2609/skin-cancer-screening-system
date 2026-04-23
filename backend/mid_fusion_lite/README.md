@@ -45,6 +45,14 @@ python -m mid_fusion_lite.runner --preset smoke --folds 0 --epochs 2
 python -m mid_fusion_lite.runner --preset full_lite --use-data-parallel true --dp-device-ids 0,1
 ```
 
+## Download backbone weights (offline Kaggle use)
+
+```bash
+python download_weight.py --backbone-name convnextv2_nano --output convnextv2_nano_backbone.pth
+```
+
+Then upload the `.pth` file to your Kaggle dataset and set `BACKBONE_WEIGHTS_PATH` to that file path.
+
 ## Notes
 
 - Split is done with `StratifiedGroupKFold` on `patient_id`.
