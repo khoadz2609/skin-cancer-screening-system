@@ -3,7 +3,7 @@
 This folder contains a self-contained multimodal pipeline for ISIC 2024:
 - image branch (EfficientNet-B0 via timm)
 - tabular branch (TABM by default, with MLP fallback)
-- mid-fusion head
+- mid-fusion head (concat or cross-modal attention)
 
 It is designed for quick experiments on Kaggle with lightweight presets.
 
@@ -56,11 +56,14 @@ Then upload the `.pth` file to your Kaggle dataset and set `BACKBONE_WEIGHTS_PAT
 ## Notes
 
 - Split is done with `StratifiedGroupKFold` on `patient_id`.
-- Tabular feature engineering now mirrors the TabM standalone notebook (engineered numerical features, patient-normalized features, per-patient category counts, and numeric-category interaction stats).
+- Tabular feature engineering now includes richer cross-context statistics: patient-normalized, patient-location-normalized, patient-location-simple-normalized, and patient-site-normalized features.
+- Added Top-solution style features for tabular branch: anatomical z-scores, area aggregates (`tbp_lv_areaMM2_patient`, `tbp_lv_areaMM2_bp`), ugly-duckling location/percentile features, and additional morphology/color composites.
+- Optional heavy tabular options are available in config: patient-level LOF feature extraction (`use_patient_lof_features`) and null-importance-style numeric filtering (`use_null_importance_filter`).
 - Tabular preprocessing (scaler + one-hot) is fitted only on train fold.
 - Fold-wise QuantileTransformer is applied on tabular matrix when `use_tabm_tabular=True` and `use_quantile_transform=True`.
 - Train sampler limits negatives per epoch using `negative_ratio` for faster iterations.
 - Validation always uses full validation fold (no resampling).
 - TABM is the default tabular encoder (`use_tabm_tabular=True` in `config.py`).
+- You can enable cross-modal attention with `fusion_mode='cross_attention'`.
 - Multi-GPU is supported via `torch.nn.DataParallel` when `use_data_parallel=True` and at least 2 CUDA devices are visible.
 - Limit DataParallel GPUs with `data_parallel_device_ids` (for example `[0, 1]`), or leave it as `None` to use all visible GPUs.

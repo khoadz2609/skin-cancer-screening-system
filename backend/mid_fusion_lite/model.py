@@ -75,6 +75,50 @@ class TabMTabularEncoder(nn.Module):
         raise RuntimeError(f"Unexpected TABM output shape: {tuple(features.shape)}")
 
 
+class CrossModalAttentionFusion(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.image_norm = nn.LayerNorm(hidden_dim)
+        self.tab_norm = nn.LayerNorm(hidden_dim)
+        self.image_to_tab = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.tab_to_image = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, image_features: torch.Tensor, tab_features: torch.Tensor) -> torch.Tensor:
+        image_token = image_features.unsqueeze(1)
+        tab_token = tab_features.unsqueeze(1)
+
+        norm_image = self.image_norm(image_token)
+        norm_tab = self.tab_norm(tab_token)
+
+        image_ctx, _ = self.image_to_tab(
+            query=norm_image,
+            key=norm_tab,
+            value=norm_tab,
+            need_weights=False,
+        )
+        tab_ctx, _ = self.tab_to_image(
+            query=norm_tab,
+            key=norm_image,
+            value=norm_image,
+            need_weights=False,
+        )
+
+        image_out = image_features + self.dropout(image_ctx.squeeze(1))
+        tab_out = tab_features + self.dropout(tab_ctx.squeeze(1))
+        return torch.cat([image_out, tab_out], dim=1)
+
+
 class MidFusionLiteModel(nn.Module):
     def __init__(
         self,
@@ -87,6 +131,9 @@ class MidFusionLiteModel(nn.Module):
         tabm_n_blocks: int,
         tabm_d_block: int,
         fusion_hidden_dim: int,
+        fusion_mode: str,
+        cross_attention_heads: int,
+        cross_attention_dropout: float,
         tab_dropout: float,
         fusion_dropout: float,
         train_image_backbone: bool = False,
@@ -129,8 +176,34 @@ class MidFusionLiteModel(nn.Module):
                 dropout=tab_dropout,
             )
 
+        self.fusion_mode = str(fusion_mode).strip().lower()
+        if self.fusion_mode not in {"concat", "cross_attention"}:
+            raise ValueError("fusion_mode must be one of: 'concat', 'cross_attention'")
+
+        if self.fusion_mode == "cross_attention":
+            if fusion_hidden_dim % int(cross_attention_heads) != 0:
+                raise ValueError(
+                    "fusion_hidden_dim must be divisible by cross_attention_heads "
+                    f"(got {fusion_hidden_dim} and {cross_attention_heads})."
+                )
+            self.tab_to_fusion = (
+                nn.Identity()
+                if tab_hidden_dim == fusion_hidden_dim
+                else nn.Linear(tab_hidden_dim, fusion_hidden_dim)
+            )
+            self.cross_modal_fusion = CrossModalAttentionFusion(
+                hidden_dim=fusion_hidden_dim,
+                num_heads=int(cross_attention_heads),
+                dropout=float(cross_attention_dropout),
+            )
+            fusion_in_dim = fusion_hidden_dim * 2
+        else:
+            self.tab_to_fusion = None
+            self.cross_modal_fusion = None
+            fusion_in_dim = fusion_hidden_dim + tab_hidden_dim
+
         self.fusion_head = nn.Sequential(
-            nn.Linear(fusion_hidden_dim + tab_hidden_dim, fusion_hidden_dim),
+            nn.Linear(fusion_in_dim, fusion_hidden_dim),
             nn.BatchNorm1d(fusion_hidden_dim),
             nn.GELU(),
             nn.Dropout(fusion_dropout),
@@ -214,7 +287,11 @@ class MidFusionLiteModel(nn.Module):
         image_features = self.image_head(image_features)
 
         tabular_features = self.tabular_encoder(tabular)
-        fused = torch.cat([image_features, tabular_features], dim=1)
+        if self.fusion_mode == "cross_attention":
+            projected_tab = self.tab_to_fusion(tabular_features)
+            fused = self.cross_modal_fusion(image_features, projected_tab)
+        else:
+            fused = torch.cat([image_features, tabular_features], dim=1)
 
         logits = self.fusion_head(fused).squeeze(1)
         return logits

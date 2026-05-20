@@ -276,6 +276,18 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
                 test_df=test_df,
                 group_col=config.group_col,
                 categorical_cols=config.categorical_cols,
+                use_contextual_group_norm_features=bool(
+                    config.use_contextual_group_norm_features
+                ),
+                use_ugly_duckling_features=bool(config.use_ugly_duckling_features),
+                use_anatomical_zscore_features=bool(
+                    config.use_anatomical_zscore_features
+                ),
+                use_area_aggregation_features=bool(
+                    config.use_area_aggregation_features
+                ),
+                use_patient_lof_features=bool(config.use_patient_lof_features),
+                patient_lof_min_group_size=int(config.patient_lof_min_group_size),
             )
         except MemoryError:
             print(
@@ -341,6 +353,11 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             ),
             quantile_noise_std=float(config.quantile_noise_std),
             quantile_random_state=config.seed + fold_index + 1,
+            use_null_importance_filter=bool(config.use_null_importance_filter),
+            null_importance_repeats=int(config.null_importance_repeats),
+            null_importance_quantile=float(config.null_importance_quantile),
+            null_importance_min_kept=int(config.null_importance_min_kept),
+            target_col=config.target_col,
         )
         preprocessor.fit(fold_train_df)
 
@@ -415,6 +432,9 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             tabm_n_blocks=config.tabm_n_blocks,
             tabm_d_block=config.tabm_d_block,
             fusion_hidden_dim=config.fusion_hidden_dim,
+            fusion_mode=config.fusion_mode,
+            cross_attention_heads=config.cross_attention_heads,
+            cross_attention_dropout=config.cross_attention_dropout,
             tab_dropout=config.tab_dropout,
             fusion_dropout=config.fusion_dropout,
             train_image_backbone=config.train_image_backbone,

@@ -85,6 +85,53 @@ ENGINEERED_NUMERIC_COLS = [
     "border_length_ratio",
     "age_size_symmetry_index",
     "index_age_size_symmetry",
+    "asymmetry_ratio",
+    "asymmetry_area_ratio",
+    "color_variation_intensity",
+    "color_contrast_ratio",
+    "shape_irregularity",
+    "border_density",
+    "size_age_ratio",
+    "area_diameter_ratio",
+    "position_norm_3d",
+    "position_angle_3d_xz",
+    "position_angle_3d_yz",
+    "lab_chroma",
+    "lab_hue",
+    "texture_contrast",
+    "texture_uniformity",
+    "color_difference_AB",
+    "color_difference_total",
+    "color_change_ratio",
+    "lesion_complexity_index",
+    "age_adjusted_lesion_size",
+    "color_uniformity_index",
+    "border_sharpness_index",
+    "relative_depth_3d",
+    "lesion_aspect_ratio",
+    "color_contrast_variation",
+    "symmetry_color_index",
+    "age_adjusted_complexity",
+    "relative_lesion_size",
+    "color_gradient_intensity",
+    "lesion_density_index",
+    "color_diversity_index",
+    "border_irregularity_size_ratio",
+    "estimated_growth_rate",
+    "color_asymmetry_ratio",
+    "sphericity_3d",
+    "relative_position_x",
+    "relative_position_y",
+    "malignancy_composite_index",
+    "lesion_complexity_index_patient_variation",
+    "color_diversity_index_patient_variation",
+    "border_irregularity_size_ratio_patient_variation",
+    "tbp_lv_areaMM2_anatomical_zscore",
+    "tbp_lv_norm_border_anatomical_zscore",
+    "tbp_lv_norm_color_anatomical_zscore",
+    "tbp_lv_areaMM2_patient",
+    "tbp_lv_areaMM2_bp",
+    "patient_lof_score",
 ]
 
 DEFAULT_CATEGORICAL_COLS = [
@@ -96,10 +143,36 @@ DEFAULT_CATEGORICAL_COLS = [
     "attribution",
 ]
 
-DEFAULT_NUMERIC_COLS = (
+CONTEXT_NORM_SUFFIXES = [
+    "patient_norm",
+    "patient_loc_norm",
+    "patient_loc_sim_norm",
+    "patient_site_general_norm",
+]
+
+UGLY_DUCKLING_SOURCE_COLS = list(BASE_NUMERIC_COLS) + list(ENGINEERED_NUMERIC_COLS)
+UGLY_DUCKLING_SUMMARY_COLS = [
+    "ud_count_location",
+    "ud_max_severity_location",
+    "ud_consistency_location",
+]
+
+
+def _deduplicate_keep_order(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+DEFAULT_NUMERIC_COLS = _deduplicate_keep_order(
     list(BASE_NUMERIC_COLS)
     + list(ENGINEERED_NUMERIC_COLS)
-    + [f"{col}_patient_norm" for col in (BASE_NUMERIC_COLS + ENGINEERED_NUMERIC_COLS)]
+    + [
+        f"{col}_{suffix}"
+        for suffix in CONTEXT_NORM_SUFFIXES
+        for col in (BASE_NUMERIC_COLS + ENGINEERED_NUMERIC_COLS)
+    ]
+    + [f"ud_loc_{col}" for col in UGLY_DUCKLING_SOURCE_COLS]
+    + [f"ud_percentile_{col}" for col in UGLY_DUCKLING_SOURCE_COLS]
+    + UGLY_DUCKLING_SUMMARY_COLS
     + ["count_per_patient"]
     + [f"{col}_count" for col in DEFAULT_CATEGORICAL_COLS]
     + [
@@ -137,7 +210,17 @@ class MidFusionLiteConfig:
 
     backbone_name: str = "efficientnet_b0"
     use_feature_engineering: bool = True
+    use_contextual_group_norm_features: bool = True
+    use_ugly_duckling_features: bool = True
+    use_anatomical_zscore_features: bool = True
+    use_area_aggregation_features: bool = True
+    use_patient_lof_features: bool = False
+    patient_lof_min_group_size: int = 5
     use_tabm_tabular: bool = True
+    use_null_importance_filter: bool = False
+    null_importance_repeats: int = 8
+    null_importance_quantile: float = 0.95
+    null_importance_min_kept: int = 64
     use_quantile_transform: bool = True
     quantile_noise_std: float = 1e-5
     tab_hidden_dim: int = 128
@@ -146,6 +229,9 @@ class MidFusionLiteConfig:
     tabm_n_blocks: int = 3
     tabm_d_block: int = 256
     fusion_hidden_dim: int = 256
+    fusion_mode: str = "concat"
+    cross_attention_heads: int = 4
+    cross_attention_dropout: float = 0.1
     tab_dropout: float = 0.1
     fusion_dropout: float = 0.2
     train_image_backbone: bool = False
