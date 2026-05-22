@@ -52,12 +52,12 @@ ENGINEERED_NUMERIC_COLS = [
     "color_uniformity",
     "position_distance_3d",
     "perimeter_to_area_ratio",
-    "area_to_perimeter_ratio",
+    # Removed: "area_to_perimeter_ratio" (inverse of perimeter_to_area_ratio)
     "lesion_visibility_score",
     "symmetry_border_consistency",
-    "consistency_symmetry_border",
+    # Removed: "consistency_symmetry_border" (duplicate of symmetry_border_consistency)
     "color_consistency",
-    "consistency_color",
+    # Removed: "consistency_color" (duplicate of color_consistency)
     "size_age_interaction",
     "hue_color_std_interaction",
     "lesion_severity_index",
@@ -69,7 +69,7 @@ ENGINEERED_NUMERIC_COLS = [
     "std_dev_contrast",
     "color_shape_composite_index",
     "lesion_orientation_3d",
-    "overall_color_difference",
+    # Removed: "overall_color_difference" (redundant with color_difference_total)
     "symmetry_perimeter_interaction",
     "comprehensive_lesion_index",
     "color_variance_ratio",
@@ -84,7 +84,7 @@ ENGINEERED_NUMERIC_COLS = [
     "shape_color_consistency",
     "border_length_ratio",
     "age_size_symmetry_index",
-    "index_age_size_symmetry",
+    # Removed: "index_age_size_symmetry" (duplicate 3-way interaction with age_size_symmetry_index)
     "asymmetry_ratio",
     "asymmetry_area_ratio",
     "color_variation_intensity",
@@ -94,8 +94,8 @@ ENGINEERED_NUMERIC_COLS = [
     "size_age_ratio",
     "area_diameter_ratio",
     "position_norm_3d",
-    "position_angle_3d_xz",
-    "position_angle_3d_yz",
+    # Removed: "position_angle_3d_xz" (redundant 3D angle)
+    # Removed: "position_angle_3d_yz" (redundant 3D angle)
     "lab_chroma",
     "lab_hue",
     "texture_contrast",
@@ -107,7 +107,7 @@ ENGINEERED_NUMERIC_COLS = [
     "age_adjusted_lesion_size",
     "color_uniformity_index",
     "border_sharpness_index",
-    "relative_depth_3d",
+    # Removed: "relative_depth_3d" (unnecessary 3D depth)
     "lesion_aspect_ratio",
     "color_contrast_variation",
     "symmetry_color_index",
@@ -119,7 +119,7 @@ ENGINEERED_NUMERIC_COLS = [
     "border_irregularity_size_ratio",
     "estimated_growth_rate",
     "color_asymmetry_ratio",
-    "sphericity_3d",
+    # Removed: "sphericity_3d" (lesion is 2D on skin, not truly 3D)
     "relative_position_x",
     "relative_position_y",
     "malignancy_composite_index",
@@ -162,25 +162,34 @@ def _deduplicate_keep_order(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+CONTEXT_NUMERIC_COLS = [
+    f"{col}_{suffix}"
+    for suffix in CONTEXT_NORM_SUFFIXES
+    for col in (BASE_NUMERIC_COLS + ENGINEERED_NUMERIC_COLS)
+]
+
+UGLY_DUCKLING_NUMERIC_COLS = [f"ud_loc_{col}" for col in UGLY_DUCKLING_SOURCE_COLS] + [
+    f"ud_percentile_{col}" for col in UGLY_DUCKLING_SOURCE_COLS
+]
+
+CATEGORICAL_COUNT_COLS = [f"{col}_count" for col in DEFAULT_CATEGORICAL_COLS]
+
+NUM_CAT_INTERACTION_COLS = [
+    f"{num_col}_{cat_col}"
+    for num_col, cat_col in itertools.product(
+        BASE_NUMERIC_COLS, DEFAULT_CATEGORICAL_COLS
+    )
+]
+
 DEFAULT_NUMERIC_COLS = _deduplicate_keep_order(
     list(BASE_NUMERIC_COLS)
     + list(ENGINEERED_NUMERIC_COLS)
-    + [
-        f"{col}_{suffix}"
-        for suffix in CONTEXT_NORM_SUFFIXES
-        for col in (BASE_NUMERIC_COLS + ENGINEERED_NUMERIC_COLS)
-    ]
-    + [f"ud_loc_{col}" for col in UGLY_DUCKLING_SOURCE_COLS]
-    + [f"ud_percentile_{col}" for col in UGLY_DUCKLING_SOURCE_COLS]
+    + CONTEXT_NUMERIC_COLS
+    + UGLY_DUCKLING_NUMERIC_COLS
     + UGLY_DUCKLING_SUMMARY_COLS
     + ["count_per_patient"]
-    + [f"{col}_count" for col in DEFAULT_CATEGORICAL_COLS]
-    + [
-        f"{num_col}_{cat_col}"
-        for num_col, cat_col in itertools.product(
-            BASE_NUMERIC_COLS, DEFAULT_CATEGORICAL_COLS
-        )
-    ]
+    + CATEGORICAL_COUNT_COLS
+    + NUM_CAT_INTERACTION_COLS
 )
 
 

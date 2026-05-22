@@ -189,23 +189,14 @@ def _add_engineered_columns(
     out["perimeter_to_area_ratio"] = out["tbp_lv_perimeterMM"] / (
         out["tbp_lv_areaMM2"] + err
     )
-    out["area_to_perimeter_ratio"] = out["tbp_lv_areaMM2"] / (
-        out["tbp_lv_perimeterMM"] + err
-    )
     out["lesion_visibility_score"] = (
         out["tbp_lv_deltaLBnorm"] + out["tbp_lv_norm_color"]
     )
     out["symmetry_border_consistency"] = (
         out["tbp_lv_symm_2axis"] * out["tbp_lv_norm_border"]
     )
-    out["consistency_symmetry_border"] = (
-        out["tbp_lv_symm_2axis"] * out["tbp_lv_norm_border"]
-    ) / (out["tbp_lv_symm_2axis"] + out["tbp_lv_norm_border"] + err)
 
     out["color_consistency"] = out["tbp_lv_stdL"] / (out["tbp_lv_Lext"] + err)
-    out["consistency_color"] = (out["tbp_lv_stdL"] * out["tbp_lv_Lext"]) / (
-        out["tbp_lv_stdL"] + out["tbp_lv_Lext"] + err
-    )
     out["size_age_interaction"] = out["clin_size_long_diam_mm"] * out["age_approx"]
     out["hue_color_std_interaction"] = out["tbp_lv_H"] * out["tbp_lv_color_std_mean"]
     out["lesion_severity_index"] = (
@@ -240,9 +231,6 @@ def _add_engineered_columns(
         + out["tbp_lv_symm_2axis"]
     ) / 3.0
     out["lesion_orientation_3d"] = np.arctan2(out["tbp_lv_y"], out["tbp_lv_x"])
-    out["overall_color_difference"] = (
-        out["tbp_lv_deltaA"] + out["tbp_lv_deltaB"] + out["tbp_lv_deltaL"]
-    ) / 3.0
 
     out["symmetry_perimeter_interaction"] = (
         out["tbp_lv_symm_2axis"] * out["tbp_lv_perimeterMM"]
@@ -294,9 +282,6 @@ def _add_engineered_columns(
     out["age_size_symmetry_index"] = (
         out["age_approx"] * out["clin_size_long_diam_mm"] * out["tbp_lv_symm_2axis"]
     )
-    out["index_age_size_symmetry"] = (
-        out["age_approx"] * out["tbp_lv_areaMM2"] * out["tbp_lv_symm_2axis"]
-    )
 
     additional_features = {
         "asymmetry_ratio": out["tbp_lv_symm_2axis"]
@@ -314,8 +299,6 @@ def _add_engineered_columns(
         "area_diameter_ratio": out["tbp_lv_areaMM2"]
         / (out["clin_size_long_diam_mm"] + err),
         "position_norm_3d": out["position_distance_3d"] / (out["tbp_lv_areaMM2"] + err),
-        "position_angle_3d_xz": np.arctan2(out["tbp_lv_z"], out["tbp_lv_x"]),
-        "position_angle_3d_yz": np.arctan2(out["tbp_lv_z"], out["tbp_lv_y"]),
         "lab_chroma": np.sqrt(np.square(out["tbp_lv_A"]) + np.square(out["tbp_lv_B"])),
         "lab_hue": np.arctan2(out["tbp_lv_B"], out["tbp_lv_A"]),
         "texture_contrast": out["tbp_lv_stdL"] / (out["tbp_lv_stdLExt"] + err),
@@ -337,9 +320,6 @@ def _add_engineered_columns(
     additional_features["color_uniformity_index"] = 1.0 / (out["color_uniformity"] + err)
     additional_features["border_sharpness_index"] = out["tbp_lv_norm_border"] / (
         out["tbp_lv_color_std_mean"] + err
-    )
-    additional_features["relative_depth_3d"] = np.abs(out["tbp_lv_z"]) / (
-        out["position_distance_3d"] + err
     )
     additional_features["lesion_aspect_ratio"] = out["clin_size_long_diam_mm"] / (
         out["tbp_lv_minorAxisMM"] + err
@@ -370,9 +350,6 @@ def _add_engineered_columns(
     )
     additional_features["color_asymmetry_ratio"] = out["tbp_lv_radial_color_std_max"] / (
         out["tbp_lv_symm_2axis"] + err
-    )
-    additional_features["sphericity_3d"] = out["volume_approximation_3d"] / (
-        np.power(out["tbp_lv_areaMM2"] + err, 1.5)
     )
     additional_features["relative_position_x"] = out["tbp_lv_x"] / (
         out["position_distance_3d"] + err
