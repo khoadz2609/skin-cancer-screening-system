@@ -42,8 +42,21 @@ If you copy this folder somewhere else, append that folder path to `sys.path`.
 ```bash
 python -m mid_fusion_lite.runner --preset quick
 python -m mid_fusion_lite.runner --preset smoke --folds 0 --epochs 2
-python -m mid_fusion_lite.runner --preset full_lite --use-data-parallel true --dp-device-ids 0,1
+python -m mid_fusion_lite.runner --preset full_lite
 ```
+
+## Stacking (GBDT on OOF + tabular)
+
+Run a GBDT stacker using Mid Fusion Lite OOF predictions plus tabular features:
+
+```bash
+python stack_gbdt.py --preset quick --mid-fusion-output-dir ./mid_fusion_lite_outputs/quick
+```
+
+Feature modes:
+- `oof-only`: only the OOF prediction as a feature
+- `numeric-only` (default): numeric tabular features + OOF prediction
+- `full`: numeric + one-hot categorical + OOF prediction
 
 ## Download backbone weights (offline Kaggle use)
 
@@ -65,5 +78,3 @@ Then upload the `.pth` file to your Kaggle dataset and set `BACKBONE_WEIGHTS_PAT
 - Validation always uses full validation fold (no resampling).
 - TABM is the default tabular encoder (`use_tabm_tabular=True` in `config.py`).
 - You can enable cross-modal attention with `fusion_mode='cross_attention'`.
-- Multi-GPU is supported via `torch.nn.DataParallel` when `use_data_parallel=True` and at least 2 CUDA devices are visible.
-- Limit DataParallel GPUs with `data_parallel_device_ids` (for example `[0, 1]`), or leave it as `None` to use all visible GPUs.

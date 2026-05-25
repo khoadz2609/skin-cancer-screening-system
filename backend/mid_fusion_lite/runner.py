@@ -87,45 +87,14 @@ def _get_device() -> torch.device:
         return torch.device("cpu")
 
 
-def _wrap_model_for_multi_gpu(
-    model: torch.nn.Module,
-    config: MidFusionLiteConfig,
-    device: torch.device,
-) -> torch.nn.Module:
-    if device.type != "cuda":
-        return model
-
-    if not bool(config.use_data_parallel):
-        return model
-
-    n_gpus = torch.cuda.device_count()
-    if n_gpus < 2:
-        return model
-
-    if config.data_parallel_device_ids is None:
-        device_ids = list(range(n_gpus))
-    else:
-        parsed_ids = [int(idx) for idx in config.data_parallel_device_ids]
-        device_ids = [idx for idx in parsed_ids if 0 <= idx < n_gpus]
-        if len(device_ids) < 2:
-            print(
-                "DataParallel requested but fewer than 2 valid GPU ids were provided. "
-                "Falling back to single GPU."
-            )
-            return model
-
-    print(f"Using DataParallel on GPUs: {device_ids}")
-    return torch.nn.DataParallel(model, device_ids=device_ids)
-
-
 def _initialize_lazy_parameters(
     model: torch.nn.Module,
     device: torch.device,
     image_size: int,
     n_tab_features: int,
 ) -> None:
-    # DataParallel cannot replicate modules that still contain
-    # UninitializedParameter (for example nn.LazyLinear).
+    # Initialize modules that still contain UninitializedParameter
+    # (for example nn.LazyLinear).
     has_uninitialized = any(
         isinstance(param, torch.nn.parameter.UninitializedParameter)
         for param in model.parameters()
@@ -448,7 +417,6 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             image_size=config.image_size,
             n_tab_features=x_train.shape[1],
         )
-        model = _wrap_model_for_multi_gpu(model=model, config=config, device=device)
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
@@ -464,7 +432,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
 
         n_pos = max(float(y_train.sum()), 1.0)
         n_neg = max(float(len(y_train) - y_train.sum()), 1.0)
-        pos_weight = n_neg / n_pos
+        pos_weight = np.sqrt(n_neg / n_pos)
 
         best_state, history, best_valid_score = fit_one_fold(
             model=model,
@@ -609,17 +577,6 @@ def main() -> None:
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--image-size", type=int, default=None)
-    parser.add_argument(
-        "--use-data-parallel",
-        default=None,
-        choices=["true", "false"],
-        help="Enable torch.nn.DataParallel across multiple GPUs",
-    )
-    parser.add_argument(
-        "--dp-device-ids",
-        default=None,
-        help="Comma-separated CUDA ids for DataParallel, e.g. 0,1",
-    )
 
     args = parser.parse_args()
 
@@ -638,12 +595,6 @@ def main() -> None:
         updates["epochs"] = args.epochs
     if args.image_size is not None:
         updates["image_size"] = args.image_size
-    if args.use_data_parallel is not None:
-        updates["use_data_parallel"] = args.use_data_parallel == "true"
-    if args.dp_device_ids is not None:
-        updates["data_parallel_device_ids"] = [
-            int(x.strip()) for x in args.dp_device_ids.split(",") if x.strip()
-        ]
 
     if updates:
         filtered_updates = _filter_supported_config_updates(config, updates)

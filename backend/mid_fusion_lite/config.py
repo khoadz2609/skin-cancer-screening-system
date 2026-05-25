@@ -247,8 +247,6 @@ class MidFusionLiteConfig:
     use_pretrained_backbone: bool = False
 
     use_amp: bool = True
-    use_data_parallel: bool = True
-    data_parallel_device_ids: Optional[list[int]] = None
     max_train_steps_per_epoch: Optional[int] = None
     max_valid_steps: Optional[int] = None
     show_predict_progress: bool = True
@@ -387,10 +385,10 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             train_batch_size=32,
             valid_batch_size=64,
             epochs=10,
-            patience=3,
+            patience=10,
             lr=3e-4,
             weight_decay=2e-4,
-            negative_ratio=10,
+            negative_ratio=5,
             backbone_name="efficientnet_b0",
             tab_hidden_dim=192,
             fusion_hidden_dim=320,
