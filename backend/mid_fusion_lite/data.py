@@ -13,7 +13,7 @@ from torch.utils.data import Dataset, WeightedRandomSampler
 
 def get_image_transforms(image_size: int) -> dict[str, A.Compose]:
     train_tfms = A.Compose(
-        [
+        [  # type: ignore[arg-type]
             A.Resize(image_size, image_size),
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.2),
@@ -30,8 +30,8 @@ def get_image_transforms(image_size: int) -> dict[str, A.Compose]:
                 p=0.5,
             ),
             A.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225),
                 max_pixel_value=255.0,
                 p=1.0,
             ),
@@ -40,11 +40,11 @@ def get_image_transforms(image_size: int) -> dict[str, A.Compose]:
         p=1.0,
     )
     valid_tfms = A.Compose(
-        [
+        [  # type: ignore[arg-type]
             A.Resize(image_size, image_size),
             A.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225),
                 max_pixel_value=255.0,
                 p=1.0,
             ),
@@ -87,11 +87,11 @@ class HDF5ImageTabularDataset(Dataset):
         return self._h5
 
     def _read_image(self, isic_id: str) -> np.ndarray:
-        raw_obj = self._get_h5()[isic_id][()]
+        raw_obj = self._get_h5()[isic_id][()]  # type: ignore[index]
         if isinstance(raw_obj, np.ndarray):
             binary = raw_obj.tobytes()
         else:
-            binary = bytes(raw_obj)
+            binary = bytes(raw_obj)  # type: ignore[arg-type]
 
         image = Image.open(BytesIO(binary)).convert("RGB")
         return np.asarray(image)
@@ -147,7 +147,7 @@ def make_balanced_sampler(
     generator.manual_seed(seed)
 
     return WeightedRandomSampler(
-        weights=torch.as_tensor(weights, dtype=torch.double),
+        weights=torch.as_tensor(weights, dtype=torch.double),  # type: ignore[arg-type]
         num_samples=num_samples,
         replacement=True,
         generator=generator,

@@ -45,19 +45,6 @@ python -m mid_fusion_lite.runner --preset smoke --folds 0 --epochs 2
 python -m mid_fusion_lite.runner --preset full_lite
 ```
 
-## Stacking (GBDT on OOF + tabular)
-
-Run a GBDT stacker using Mid Fusion Lite OOF predictions plus tabular features:
-
-```bash
-python stack_gbdt.py --preset quick --mid-fusion-output-dir ./mid_fusion_lite_outputs/quick
-```
-
-Feature modes:
-- `oof-only`: only the OOF prediction as a feature
-- `numeric-only` (default): numeric tabular features + OOF prediction
-- `full`: numeric + one-hot categorical + OOF prediction
-
 ## Download backbone weights (offline Kaggle use)
 
 ```bash

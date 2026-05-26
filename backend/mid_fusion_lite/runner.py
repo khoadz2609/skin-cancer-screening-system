@@ -203,8 +203,6 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
 
     print(f"Running preset: {config.preset_name}")
     print(f"Device: {device.type.upper()}")
-    if device.type == "cuda":
-        print(f"CUDA device count: {torch.cuda.device_count()}")
     print(f"Output directory: {output_dir.resolve()}")
 
     requested_numeric_cols = set(config.numeric_cols)
