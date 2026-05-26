@@ -94,19 +94,25 @@ class CrossModalAttentionFusion(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, image_features: torch.Tensor, tab_features: torch.Tensor) -> torch.Tensor:
-        image_token = image_features.unsqueeze(1)
-        tab_token = tab_features.unsqueeze(1)
+    def forward(
+        self, image_features: torch.Tensor, tab_features: torch.Tensor
+    ) -> torch.Tensor:
+        # image_features: (B, L, hidden_dim) where L is number of spatial patches
+        # tab_features: (B, hidden_dim)
+        tab_token = tab_features.unsqueeze(1)  # (B, 1, hidden_dim)
 
-        norm_image = self.image_norm(image_token)
+        norm_image = self.image_norm(image_features)
         norm_tab = self.tab_norm(tab_token)
 
+        # Image patches attend to Tabular information
         image_ctx, _ = self.image_to_tab(
             query=norm_image,
             key=norm_tab,
             value=norm_tab,
             need_weights=False,
         )
+
+        # Tabular information attends to Image patches
         tab_ctx, _ = self.tab_to_image(
             query=norm_tab,
             key=norm_image,
@@ -114,9 +120,14 @@ class CrossModalAttentionFusion(nn.Module):
             need_weights=False,
         )
 
-        image_out = image_features + self.dropout(image_ctx.squeeze(1))
-        tab_out = tab_features + self.dropout(tab_ctx.squeeze(1))
-        return torch.cat([image_out, tab_out], dim=1)
+        image_out = image_features + self.dropout(image_ctx)  # (B, L, D)
+        tab_out = tab_token + self.dropout(tab_ctx)  # (B, 1, D)
+
+        # Average pooling over spatial dimensions
+        image_out_pooled = image_out.mean(dim=1)  # (B, D)
+        tab_out_squeezed = tab_out.squeeze(1)  # (B, D)
+
+        return torch.cat([image_out_pooled, tab_out_squeezed], dim=1)
 
 
 class MidFusionLiteModel(nn.Module):
@@ -141,10 +152,16 @@ class MidFusionLiteModel(nn.Module):
         backbone_weights_path: str | None = None,
     ) -> None:
         super().__init__()
+
+        self.fusion_mode = str(fusion_mode).strip().lower()
+        if self.fusion_mode not in {"concat", "cross_attention"}:
+            raise ValueError("fusion_mode must be one of: 'concat', 'cross_attention'")
+
         self.image_encoder = self._build_image_encoder(
             backbone_name=backbone_name,
             use_pretrained_backbone=use_pretrained_backbone,
             backbone_weights_path=backbone_weights_path,
+            fusion_mode=self.fusion_mode,
         )
 
         if not train_image_backbone:
@@ -175,10 +192,6 @@ class MidFusionLiteModel(nn.Module):
                 hidden_dim=tab_hidden_dim,
                 dropout=tab_dropout,
             )
-
-        self.fusion_mode = str(fusion_mode).strip().lower()
-        if self.fusion_mode not in {"concat", "cross_attention"}:
-            raise ValueError("fusion_mode must be one of: 'concat', 'cross_attention'")
 
         if self.fusion_mode == "cross_attention":
             if fusion_hidden_dim % int(cross_attention_heads) != 0:
@@ -215,11 +228,12 @@ class MidFusionLiteModel(nn.Module):
         backbone_name: str,
         use_pretrained_backbone: bool,
         backbone_weights_path: str | None,
+        fusion_mode: str,
     ) -> nn.Module:
         create_kwargs = {
             "model_name": backbone_name,
             "num_classes": 0,
-            "global_pool": "avg",
+            "global_pool": "" if fusion_mode == "cross_attention" else "avg",
         }
 
         encoder = timm.create_model(pretrained=False, **create_kwargs)
@@ -282,9 +296,28 @@ class MidFusionLiteModel(nn.Module):
 
     def forward(self, images: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:
         image_features = self.image_encoder(images)
-        if image_features.ndim > 2:
-            image_features = torch.flatten(image_features, 1)
-        image_features = self.image_head(image_features)
+
+        if self.fusion_mode == "cross_attention":
+            if image_features.ndim == 4:
+                # image_features is (B, C, H, W)
+                B, C, H, W = image_features.shape
+                # Reshape to (B, H*W, C) for MultiheadAttention
+                image_features = image_features.view(B, C, -1).transpose(1, 2)
+            elif image_features.ndim == 3:
+                # Already (B, L, C) from sequence-based backbones
+                pass
+            else:
+                raise ValueError(
+                    f"Unexpected image_features shape for cross_attention: {image_features.shape}"
+                )
+
+            image_features = self.image_head(
+                image_features
+            )  # (B, H*W or L, fusion_hidden_dim)
+        else:
+            if image_features.ndim > 2:
+                image_features = torch.flatten(image_features, 1)
+            image_features = self.image_head(image_features)
 
         tabular_features = self.tabular_encoder(tabular)
         if self.fusion_mode == "cross_attention":
