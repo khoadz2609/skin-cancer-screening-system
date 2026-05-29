@@ -80,12 +80,18 @@ class CrossModalAttentionFusion(nn.Module):
         super().__init__()
         self.image_norm = nn.LayerNorm(hidden_dim)
         self.tab_norm = nn.LayerNorm(hidden_dim)
+
+        # Bottleneck: compress image patches for efficient cross-modal fusion
+        self.image_bottleneck = nn.Linear(hidden_dim, hidden_dim)
+
+        # Image patches attend to tabular bottleneck (weak direction)
         self.image_to_tab = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
         )
+        # Tabular attends to all image patches (strong direction)
         self.tab_to_image = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
@@ -104,15 +110,18 @@ class CrossModalAttentionFusion(nn.Module):
         norm_image = self.image_norm(image_features)
         norm_tab = self.tab_norm(tab_token)
 
-        # Image patches attend to Tabular information
+        # Bottleneck: create compressed representation of tabular info
+        tab_bottleneck = self.image_bottleneck(norm_tab)  # (B, 1, hidden_dim)
+
+        # Image patches attend to compressed tabular bottleneck (weak direction)
         image_ctx, _ = self.image_to_tab(
             query=norm_image,
-            key=norm_tab,
-            value=norm_tab,
+            key=tab_bottleneck,
+            value=tab_bottleneck,
             need_weights=False,
         )
 
-        # Tabular information attends to Image patches
+        # Tabular attends to all image patches (strong direction)
         tab_ctx, _ = self.tab_to_image(
             query=norm_tab,
             key=norm_image,

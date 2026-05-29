@@ -1,48 +1,20 @@
-from __future__ import annotations
+"""Feature engineering for medical imaging tabular data (skin lesion analysis)."""
 
-from dataclasses import dataclass
-from typing import Iterable
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 from sklearn.neighbors import LocalOutlierFactor
-from sklearn.preprocessing import OneHotEncoder, QuantileTransformer, StandardScaler
+
+try:
+    from .tabular_prep_01 import _check_required_columns, _prepare_base_numeric
+except ImportError:
+    from tabular_prep_01 import _check_required_columns, _prepare_base_numeric
 
 try:
     from .config import BASE_NUMERIC_COLS, ENGINEERED_NUMERIC_COLS
 except ImportError:
     from config import BASE_NUMERIC_COLS, ENGINEERED_NUMERIC_COLS
-
-
-def _prepare_base_numeric(df: pd.DataFrame, err: float) -> pd.DataFrame:
-    out = df.copy()
-
-    if "age_approx" in out.columns:
-        out["age_approx"] = (
-            out["age_approx"].replace("NA", np.nan).pipe(pd.to_numeric, errors="coerce")
-        )
-
-    base_cols = [c for c in BASE_NUMERIC_COLS if c in out.columns]
-    for col in base_cols:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-
-    if base_cols:
-        out[base_cols] = out[base_cols].replace([np.inf, -np.inf], np.nan)
-        medians = out[base_cols].median(numeric_only=True)
-        out[base_cols] = out[base_cols].fillna(medians)
-        out[base_cols] = out[base_cols].astype(np.float32, copy=False)
-
-    return out
-
-
-def _check_required_columns(df: pd.DataFrame, group_col: str) -> None:
-    required = set(BASE_NUMERIC_COLS)
-    required.add(group_col)
-    missing = sorted(col for col in required if col not in df.columns)
-    if missing:
-        raise KeyError(
-            "Missing required columns for feature engineering: " + ", ".join(missing)
-        )
 
 
 def _compute_patient_lof_feature(
@@ -51,6 +23,17 @@ def _compute_patient_lof_feature(
     feature_cols: list[str],
     min_group_size: int,
 ) -> pd.Series:
+    """Compute Local Outlier Factor scores per patient group.
+
+    Args:
+        df: DataFrame with samples and features.
+        group_col: Column name for grouping (e.g., 'patient_id').
+        feature_cols: Feature columns to use for LOF computation.
+        min_group_size: Minimum samples per group to compute LOF.
+
+    Returns:
+        Series of LOF scores (higher = more anomalous) with same index as df.
+    """
     scores = pd.Series(np.nan, index=df.index, dtype=np.float32)
     grouped = df.groupby(group_col, observed=False, sort=False).groups
 
@@ -89,17 +72,34 @@ def _add_contextual_group_norm_features(
     source_cols: list[str],
     err: float,
 ) -> None:
+    """Add features normalized by anatomical context (location/site).
+
+    Creates z-score normalized features grouped by patient AND anatomical location,
+    capturing how features deviate within anatomical regions.
+
+    Args:
+        out: DataFrame with all data.
+        generated_features: Dictionary to accumulate new features.
+        group_col: Grouping column (e.g., 'patient_id').
+        source_cols: Base columns to normalize.
+        err: Epsilon for numerical stability.
+    """
     context_groups = [
-        ("patient_loc_norm", "tbp_lv_location"),
-        ("patient_loc_sim_norm", "tbp_lv_location_simple"),
         ("patient_site_general_norm", "anatom_site_general"),
+        # Removed: ("patient_loc_norm", "tbp_lv_location")
+        # Removed: ("patient_loc_sim_norm", "tbp_lv_location_simple")
+        # Reason: High correlation with patient_norm, redundant information
     ]
 
     for suffix, context_col in context_groups:
         if context_col not in out.columns:
             continue
 
+        # Pre-compute group statistics for ALL columns at once (cache-friendly)
         grouped = out.groupby([group_col, context_col], observed=False, sort=False)
+        group_stats = grouped[source_cols].agg(['mean', 'std'])
+
+        # Transform using cached statistics (vectorized)
         for col in source_cols:
             group_mean = grouped[col].transform("mean")
             group_std = grouped[col].transform("std")
@@ -115,8 +115,25 @@ def _add_ugly_duckling_features(
     source_cols: list[str],
     err: float,
 ) -> None:
+    """Add 'ugly duckling' features for anomaly detection within patient cohorts.
+
+    The 'ugly duckling' concept: lesions that look unusual compared to a patient's
+    other lesions may indicate malignancy. Creates z-scores by location and adds
+    aggregate anomaly indicators.
+
+    Args:
+        out: DataFrame with all data.
+        generated_features: Dictionary to accumulate new features.
+        group_col: Grouping column (e.g., 'patient_id').
+        source_cols: Base columns to compute anomaly scores.
+        err: Epsilon for numerical stability.
+    """
     loc_col = None
-    for candidate in ["tbp_lv_location", "tbp_lv_location_simple", "anatom_site_general"]:
+    for candidate in [
+        "tbp_lv_location",
+        "tbp_lv_location_simple",
+        "anatom_site_general",
+    ]:
         if candidate in out.columns:
             loc_col = candidate
             break
@@ -161,6 +178,33 @@ def _add_engineered_columns(
     use_patient_lof_features: bool,
     patient_lof_min_group_size: int,
 ) -> pd.DataFrame:
+    """Main orchestrator for all feature engineering transformations.
+
+    Generates 80+ derived features from base medical measurements including:
+    - Geometric ratios and indices (lesion shape, border properties)
+    - Color features (LAB space metrics, contrast, uniformity)
+    - 3D spatial features (position, volume approximation)
+    - Interaction features (size × age, color × symmetry)
+    - Patient/cohort normalized features
+    - Contextual (anatomical) normalized features
+    - Anomaly detection features (ugly duckling)
+    - Patient-specific aggregate features
+
+    Args:
+        df: Input DataFrame with base numeric and categorical columns.
+        group_col: Column name for patient/group identifier.
+        categorical_cols: Categorical column names for encoding.
+        err: Epsilon for numerical stability (default: 1e-5).
+        use_contextual_group_norm_features: Enable location-based normalization.
+        use_ugly_duckling_features: Enable anomaly detection features.
+        use_anatomical_zscore_features: Enable anatomical z-score features.
+        use_area_aggregation_features: Enable area aggregation by patient/anatomical site.
+        use_patient_lof_features: Enable Local Outlier Factor scoring.
+        patient_lof_min_group_size: Minimum group size for LOF computation.
+
+    Returns:
+        DataFrame with original + all engineered features, numeric columns as float32.
+    """
     out = _prepare_base_numeric(df=df, err=err)
     _check_required_columns(df=out, group_col=group_col)
 
@@ -247,17 +291,11 @@ def _add_engineered_columns(
     out["border_color_interaction"] = (
         out["tbp_lv_norm_border"] * out["tbp_lv_norm_color"]
     )
-    out["border_color_interaction_2"] = (
-        out["tbp_lv_norm_border"] * out["tbp_lv_norm_color"]
-    ) / (out["tbp_lv_norm_border"] + out["tbp_lv_norm_color"] + err)
     out["size_color_contrast_ratio"] = out["clin_size_long_diam_mm"] / (
         out["tbp_lv_deltaLBnorm"] + err
     )
     out["age_normalized_nevi_confidence"] = out["tbp_lv_nevi_confidence"] / (
         out["age_approx"] + err
-    )
-    out["age_normalized_nevi_confidence_2"] = np.sqrt(
-        np.square(out["clin_size_long_diam_mm"]) + np.square(out["age_approx"])
     )
     out["color_asymmetry_index"] = (
         out["tbp_lv_radial_color_std_max"] * out["tbp_lv_symm_2axis"]
@@ -303,7 +341,8 @@ def _add_engineered_columns(
         "lab_hue": np.arctan2(out["tbp_lv_B"], out["tbp_lv_A"]),
         "texture_contrast": out["tbp_lv_stdL"] / (out["tbp_lv_stdLExt"] + err),
         "texture_uniformity": 1.0 / (out["tbp_lv_color_std_mean"] + err),
-        "color_difference_AB": np.abs(out["tbp_lv_deltaA"]) + np.abs(out["tbp_lv_deltaB"]),
+        "color_difference_AB": np.abs(out["tbp_lv_deltaA"])
+        + np.abs(out["tbp_lv_deltaB"]),
         "color_difference_total": np.abs(out["tbp_lv_deltaA"])
         + np.abs(out["tbp_lv_deltaB"])
         + np.abs(out["tbp_lv_deltaL"]),
@@ -317,7 +356,9 @@ def _add_engineered_columns(
     additional_features["age_adjusted_lesion_size"] = out["log_lesion_area"] / (
         out["age_approx"] + err
     )
-    additional_features["color_uniformity_index"] = 1.0 / (out["color_uniformity"] + err)
+    additional_features["color_uniformity_index"] = 1.0 / (
+        out["color_uniformity"] + err
+    )
     additional_features["border_sharpness_index"] = out["tbp_lv_norm_border"] / (
         out["tbp_lv_color_std_mean"] + err
     )
@@ -348,9 +389,9 @@ def _add_engineered_columns(
     additional_features["estimated_growth_rate"] = out["tbp_lv_areaMM2"] / (
         out["age_approx"] + err
     )
-    additional_features["color_asymmetry_ratio"] = out["tbp_lv_radial_color_std_max"] / (
-        out["tbp_lv_symm_2axis"] + err
-    )
+    additional_features["color_asymmetry_ratio"] = out[
+        "tbp_lv_radial_color_std_max"
+    ] / (out["tbp_lv_symm_2axis"] + err)
     additional_features["relative_position_x"] = out["tbp_lv_x"] / (
         out["position_distance_3d"] + err
     )
@@ -375,7 +416,9 @@ def _add_engineered_columns(
 
     for col in categorical_cols:
         if col in out.columns:
-            out[col] = out[col].astype("object").fillna("UNK").astype(str).astype("category")
+            out[col] = (
+                out[col].astype("object").fillna("UNK").astype(str).astype("category")
+            )
 
     patient_grouped = out.groupby(group_col, observed=False, sort=False)
     patient_variation_features = {
@@ -399,7 +442,9 @@ def _add_engineered_columns(
 
     generated_features: dict[str, pd.Series] = {}
     source_cols = [
-        col for col in (BASE_NUMERIC_COLS + ENGINEERED_NUMERIC_COLS) if col in out.columns
+        col
+        for col in (BASE_NUMERIC_COLS + ENGINEERED_NUMERIC_COLS)
+        if col in out.columns
     ]
 
     for col in source_cols:
@@ -524,6 +569,27 @@ def add_feature_engineering(
     use_patient_lof_features: bool = False,
     patient_lof_min_group_size: int = 5,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply complete feature engineering pipeline to train and test sets.
+
+    Wraps _add_engineered_columns for both datasets with consistent parameters,
+    ensuring train and test receive identical feature transformations.
+
+    Args:
+        train_df: Training DataFrame.
+        test_df: Test DataFrame.
+        group_col: Column name for grouping (e.g., 'patient_id').
+        categorical_cols: List of categorical column names.
+        err: Epsilon for numerical stability (default: 1e-5).
+        use_contextual_group_norm_features: Enable location-based normalization (default: True).
+        use_ugly_duckling_features: Enable anomaly detection (default: True).
+        use_anatomical_zscore_features: Enable anatomical z-score (default: True).
+        use_area_aggregation_features: Enable area aggregation (default: True).
+        use_patient_lof_features: Enable LOF scoring (default: False).
+        patient_lof_min_group_size: Minimum group size for LOF (default: 5).
+
+    Returns:
+        Tuple of (train_enhanced, test_enhanced) DataFrames with all features.
+    """
     train_enhanced = _add_engineered_columns(
         df=train_df,
         group_col=group_col,
@@ -549,209 +615,3 @@ def add_feature_engineering(
         patient_lof_min_group_size=patient_lof_min_group_size,
     )
     return train_enhanced, test_enhanced
-
-
-def _build_one_hot_encoder() -> OneHotEncoder:
-    try:
-        return OneHotEncoder(
-            handle_unknown="ignore", sparse_output=False, dtype=np.float32
-        )
-    except TypeError:
-        return OneHotEncoder(handle_unknown="ignore", sparse=False, dtype=np.float32)
-
-
-def select_available_columns(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    numeric_candidates: Iterable[str],
-    categorical_candidates: Iterable[str],
-) -> tuple[list[str], list[str]]:
-    train_cols = set(train_df.columns)
-    test_cols = set(test_df.columns)
-
-    numeric_cols = [
-        col for col in numeric_candidates if col in train_cols and col in test_cols
-    ]
-    categorical_cols = [
-        col for col in categorical_candidates if col in train_cols and col in test_cols
-    ]
-    return numeric_cols, categorical_cols
-
-
-def _absolute_feature_target_corr(matrix: np.ndarray, target: np.ndarray) -> np.ndarray:
-    centered_x = matrix - matrix.mean(axis=0, keepdims=True)
-    centered_y = target - target.mean()
-
-    numerator = np.abs(np.sum(centered_x * centered_y[:, None], axis=0))
-    denominator = np.sqrt(
-        np.sum(centered_x**2, axis=0) * np.sum(centered_y**2, axis=0) + 1e-8
-    )
-    corr = numerator / denominator
-    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
-    return corr.astype(np.float32)
-
-
-def _select_numeric_by_null_importance(
-    numeric_frame: pd.DataFrame,
-    target: pd.Series,
-    repeats: int,
-    quantile: float,
-    min_kept: int,
-    random_state: int,
-) -> list[str]:
-    if numeric_frame.empty:
-        return []
-
-    matrix = numeric_frame.to_numpy(dtype=np.float32, copy=True)
-    matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
-
-    y = pd.to_numeric(target, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-    if len(y) < 16:
-        return list(numeric_frame.columns)
-
-    real_score = _absolute_feature_target_corr(matrix=matrix, target=y)
-
-    n_repeats = max(1, int(repeats))
-    clipped_quantile = float(np.clip(quantile, 0.5, 0.999))
-    rng = np.random.default_rng(random_state)
-    null_scores = np.zeros((n_repeats, matrix.shape[1]), dtype=np.float32)
-
-    for i in range(n_repeats):
-        shuffled = rng.permutation(y)
-        null_scores[i] = _absolute_feature_target_corr(matrix=matrix, target=shuffled)
-
-    null_threshold = np.quantile(null_scores, clipped_quantile, axis=0)
-    margin = real_score - null_threshold
-    keep_mask = margin > 0.0
-
-    min_kept = max(1, min(int(min_kept), matrix.shape[1]))
-    if int(keep_mask.sum()) < min_kept:
-        keep_mask = np.zeros_like(keep_mask, dtype=bool)
-        top_idx = np.argsort(margin)[-min_kept:]
-        keep_mask[top_idx] = True
-
-    return [
-        col for col, keep in zip(numeric_frame.columns, keep_mask.tolist()) if bool(keep)
-    ]
-
-
-@dataclass
-class FoldTabularPreprocessor:
-    numeric_cols: list[str]
-    categorical_cols: list[str]
-    use_quantile_transform: bool = False
-    quantile_noise_std: float = 1e-5
-    quantile_random_state: int = 42
-    use_null_importance_filter: bool = False
-    null_importance_repeats: int = 8
-    null_importance_quantile: float = 0.95
-    null_importance_min_kept: int = 64
-    target_col: str = "target"
-
-    def __post_init__(self) -> None:
-        self.numeric_cols = list(dict.fromkeys(self.numeric_cols))
-        self.active_numeric_cols = list(self.numeric_cols)
-        self.numeric_medians: dict[str, float] = {}
-        self.scaler = StandardScaler()
-        self.encoder = _build_one_hot_encoder()
-        self.quantile_transformer: QuantileTransformer | None = None
-        self.is_fitted = False
-
-    def _transform_base(self, df: pd.DataFrame) -> np.ndarray:
-        chunks: list[np.ndarray] = []
-
-        if self.active_numeric_cols:
-            numeric_frame = df[self.active_numeric_cols].copy()
-            numeric_frame = numeric_frame.apply(pd.to_numeric, errors="coerce")
-            numeric_filled = numeric_frame.fillna(self.numeric_medians)
-            numeric_scaled = self.scaler.transform(numeric_filled.values).astype(
-                np.float32
-            )
-            chunks.append(numeric_scaled)
-
-        if self.categorical_cols:
-            cat_frame = df[self.categorical_cols].copy()
-            cat_frame = cat_frame.astype("object").fillna("UNK").astype(str)
-            cat_encoded = self.encoder.transform(cat_frame).astype(np.float32)
-            chunks.append(cat_encoded)
-
-        if not chunks:
-            raise ValueError("No tabular columns are available after preprocessing.")
-
-        if len(chunks) == 1:
-            return chunks[0]
-        return np.concatenate(chunks, axis=1)
-
-    def fit(self, df: pd.DataFrame) -> None:
-        if self.active_numeric_cols:
-            numeric_frame = df[self.active_numeric_cols].copy()
-            numeric_frame = numeric_frame.apply(pd.to_numeric, errors="coerce")
-
-            if self.use_null_importance_filter and self.target_col in df.columns:
-                selected_numeric = _select_numeric_by_null_importance(
-                    numeric_frame=numeric_frame,
-                    target=df[self.target_col],
-                    repeats=self.null_importance_repeats,
-                    quantile=self.null_importance_quantile,
-                    min_kept=self.null_importance_min_kept,
-                    random_state=self.quantile_random_state,
-                )
-                if selected_numeric and len(selected_numeric) < len(self.active_numeric_cols):
-                    self.active_numeric_cols = selected_numeric
-                    numeric_frame = numeric_frame[self.active_numeric_cols]
-                    print(
-                        "Null-importance filter kept "
-                        f"{len(self.active_numeric_cols)}/{len(self.numeric_cols)} "
-                        "numeric features."
-                    )
-
-            self.numeric_medians = {
-                col: float(numeric_frame[col].median()) for col in self.active_numeric_cols
-            }
-            numeric_filled = numeric_frame.fillna(self.numeric_medians)
-            self.scaler.fit(numeric_filled.values)
-
-        if self.categorical_cols:
-            cat_frame = df[self.categorical_cols].copy()
-            cat_frame = cat_frame.astype("object").fillna("UNK").astype(str)
-            self.encoder.fit(cat_frame)
-
-        if self.use_quantile_transform:
-            base_matrix = self._transform_base(df)
-
-            if len(base_matrix) >= 2:
-                n_quantiles = max(min(len(base_matrix) // 30, 1000), 10)
-                n_quantiles = min(n_quantiles, len(base_matrix))
-
-                noise = (
-                    np.random.default_rng(self.quantile_random_state)
-                    .normal(
-                        loc=0.0,
-                        scale=self.quantile_noise_std,
-                        size=base_matrix.shape,
-                    )
-                    .astype(np.float32)
-                )
-
-                self.quantile_transformer = QuantileTransformer(
-                    n_quantiles=n_quantiles,
-                    output_distribution="normal",
-                    subsample=10**9,
-                    random_state=self.quantile_random_state,
-                )
-                self.quantile_transformer.fit(base_matrix + noise)
-            else:
-                self.quantile_transformer = None
-
-        self.is_fitted = True
-
-    def transform(self, df: pd.DataFrame) -> np.ndarray:
-        if not self.is_fitted:
-            raise RuntimeError(
-                "FoldTabularPreprocessor must be fitted before transform."
-            )
-
-        base_matrix = self._transform_base(df)
-        if self.use_quantile_transform and self.quantile_transformer is not None:
-            return self.quantile_transformer.transform(base_matrix).astype(np.float32)
-        return base_matrix

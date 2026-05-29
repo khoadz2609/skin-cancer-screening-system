@@ -30,12 +30,9 @@ try:
         get_image_transforms,
         make_balanced_sampler,
     )
+    from .tabular_engineering_02 import add_feature_engineering
     from .model import MidFusionLiteModel
-    from .tabular import (
-        FoldTabularPreprocessor,
-        add_feature_engineering,
-        select_available_columns,
-    )
+    from .tabular_preprocessor_04 import FoldTabularPreprocessor, select_available_columns
     from .train import fit_one_fold, partial_auc_score, predict_loader
 except ImportError:
     from config import (
@@ -44,19 +41,15 @@ except ImportError:
         get_preset_config,
         resolve_data_paths,
     )
-    from model import MidFusionLiteModel
-    from tabular import (
-        FoldTabularPreprocessor,
-        add_feature_engineering,
-        select_available_columns,
-    )
-    from train import fit_one_fold, partial_auc_score, predict_loader
-
     from data import (
         HDF5ImageTabularDataset,
         get_image_transforms,
         make_balanced_sampler,
     )
+    from tabular_engineering_02 import add_feature_engineering
+    from model import MidFusionLiteModel
+    from tabular_preprocessor_04 import FoldTabularPreprocessor, select_available_columns
+    from train import fit_one_fold, partial_auc_score, predict_loader
 
 
 def set_seed(seed: int) -> None:
@@ -430,7 +423,8 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
 
         n_pos = max(float(y_train.sum()), 1.0)
         n_neg = max(float(len(y_train) - y_train.sum()), 1.0)
-        pos_weight = np.sqrt(n_neg / n_pos)
+        # Class balancing via WeightedRandomSampler only (no double weighting)
+        pos_weight = 1.0  # No loss weighting, rely on sampler
 
         best_state, history, best_valid_score = fit_one_fold(
             model=model,

@@ -74,10 +74,10 @@ ENGINEERED_NUMERIC_COLS = [
     "comprehensive_lesion_index",
     "color_variance_ratio",
     "border_color_interaction",
-    "border_color_interaction_2",
+    # Removed: "border_color_interaction_2" (redundant logic with border_color_interaction)
     "size_color_contrast_ratio",
     "age_normalized_nevi_confidence",
-    "age_normalized_nevi_confidence_2",
+    # Removed: "age_normalized_nevi_confidence_2" (invalid combination of size + age)
     "color_asymmetry_index",
     "volume_approximation_3d",
     "color_range",
@@ -144,10 +144,9 @@ DEFAULT_CATEGORICAL_COLS = [
 ]
 
 CONTEXT_NORM_SUFFIXES = [
-    "patient_norm",
-    "patient_loc_norm",
-    "patient_loc_sim_norm",
-    "patient_site_general_norm",
+    "patient_norm",  # Z-score normalized by patient
+    "patient_site_general_norm",  # Z-score normalized by anatomical site
+    # Removed: "patient_loc_norm", "patient_loc_sim_norm" (redundant, high correlation)
 ]
 
 UGLY_DUCKLING_SOURCE_COLS = list(BASE_NUMERIC_COLS) + list(ENGINEERED_NUMERIC_COLS)
@@ -382,12 +381,12 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             n_splits=5,
             fold_indices=None,
             image_size=192,
-            train_batch_size=32,
+            train_batch_size=48,  # Increased from 32: larger batches for 10 epochs
             valid_batch_size=64,
             epochs=10,
             patience=10,
             lr=3e-4,
-            weight_decay=2e-4,
+            weight_decay=1e-4,  # Reduced from 2e-4: less regularization for longer training
             negative_ratio=5,
             backbone_name="efficientnet_b0",
             tab_hidden_dim=192,
@@ -413,7 +412,7 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
         valid_batch_size=64,
         epochs=5,
         patience=2,
-        lr=5e-4,
+        lr=3e-4,  # Reduced from 5e-4: match full_lite for consistency
         weight_decay=1e-4,
         negative_ratio=6,
         backbone_name="efficientnet_b0",
