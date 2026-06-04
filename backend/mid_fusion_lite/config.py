@@ -237,7 +237,7 @@ class MidFusionLiteConfig:
     tabm_n_blocks: int = 3
     tabm_d_block: int = 256
     fusion_hidden_dim: int = 256
-    fusion_mode: str = "concat"
+    fusion_mode: str = "gmu"
     cross_attention_heads: int = 4
     cross_attention_dropout: float = 0.1
     tab_dropout: float = 0.1

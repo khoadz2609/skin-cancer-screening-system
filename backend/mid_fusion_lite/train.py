@@ -81,7 +81,15 @@ def train_one_epoch(
 
         with _autocast_context(device=device, use_amp=use_amp):
             logits = model(images, tabular)
-            loss = criterion(logits, targets)
+            
+            if isinstance(logits, tuple) and len(logits) == 3:
+                fusion_logits, image_logits, tab_logits = logits
+                loss_fusion = criterion(fusion_logits, targets)
+                loss_image = criterion(image_logits, targets)
+                loss_tab = criterion(tab_logits, targets)
+                loss = loss_fusion + 0.5 * loss_image + 0.2 * loss_tab
+            else:
+                loss = criterion(logits, targets)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)

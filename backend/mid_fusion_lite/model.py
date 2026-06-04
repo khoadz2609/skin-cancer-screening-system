@@ -139,6 +139,32 @@ class CrossModalAttentionFusion(nn.Module):
         return torch.cat([image_out_pooled, tab_out_squeezed], dim=1)
 
 
+class GatedMultimodalUnit(nn.Module):
+    def __init__(self, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.image_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+        self.image_transform = nn.Linear(hidden_dim, hidden_dim)
+        self.tab_transform = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, image_features: torch.Tensor, tab_features: torch.Tensor) -> torch.Tensor:
+        concat_features = torch.cat([image_features, tab_features], dim=1)
+        z = self.image_gate(concat_features) # (B, 1)
+        
+        h_image = self.image_transform(image_features)
+        h_tab = self.tab_transform(tab_features)
+        
+        # GMU equation
+        fused = z * h_image + (1.0 - z) * h_tab
+        return fused
+
+
 class MidFusionLiteModel(nn.Module):
     def __init__(
         self,
@@ -163,8 +189,8 @@ class MidFusionLiteModel(nn.Module):
         super().__init__()
 
         self.fusion_mode = str(fusion_mode).strip().lower()
-        if self.fusion_mode not in {"concat", "cross_attention"}:
-            raise ValueError("fusion_mode must be one of: 'concat', 'cross_attention'")
+        if self.fusion_mode not in {"concat", "cross_attention", "gmu"}:
+            raise ValueError("fusion_mode must be one of: 'concat', 'cross_attention', 'gmu'")
 
         self.image_encoder = self._build_image_encoder(
             backbone_name=backbone_name,
@@ -219,10 +245,26 @@ class MidFusionLiteModel(nn.Module):
                 dropout=float(cross_attention_dropout),
             )
             fusion_in_dim = fusion_hidden_dim * 2
+        elif self.fusion_mode == "gmu":
+            self.tab_to_fusion = (
+                nn.Identity()
+                if tab_hidden_dim == fusion_hidden_dim
+                else nn.Linear(tab_hidden_dim, fusion_hidden_dim)
+            )
+            self.cross_modal_fusion = GatedMultimodalUnit(
+                hidden_dim=fusion_hidden_dim,
+                dropout=fusion_dropout,
+            )
+            fusion_in_dim = fusion_hidden_dim
         else:
             self.tab_to_fusion = None
             self.cross_modal_fusion = None
             fusion_in_dim = fusion_hidden_dim + tab_hidden_dim
+
+        self.image_only_head = nn.Linear(fusion_hidden_dim, 1)
+        self.tabular_only_head = nn.Linear(tab_hidden_dim, 1)
+        self.modality_dropout_prob = 0.15
+
 
         self.fusion_head = nn.Sequential(
             nn.Linear(fusion_in_dim, fusion_hidden_dim),
@@ -303,37 +345,42 @@ class MidFusionLiteModel(nn.Module):
             f"| missing={len(missing)} | unexpected={len(unexpected)}",
         )
 
-    def forward(self, images: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:
+    def forward(self, images: torch.Tensor, tabular: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | torch.Tensor:
         image_features = self.image_encoder(images)
 
         if self.fusion_mode == "cross_attention":
             if image_features.ndim == 4:
-                # image_features is (B, C, H, W)
                 B, C, H, W = image_features.shape
-                # Reshape to (B, H*W, C) for MultiheadAttention
                 image_features = image_features.view(B, C, -1).transpose(1, 2)
-            elif image_features.ndim == 3:
-                # Already (B, L, C) from sequence-based backbones
-                pass
-            else:
-                raise ValueError(
-                    f"Unexpected image_features shape for cross_attention: {image_features.shape}"
-                )
-
-            image_features = self.image_head(
-                image_features
-            )  # (B, H*W or L, fusion_hidden_dim)
+            image_features = self.image_head(image_features)
+            
+            image_pooled = image_features.mean(dim=1) if image_features.ndim == 3 else image_features
+            image_logits = self.image_only_head(image_pooled).squeeze(1)
         else:
             if image_features.ndim > 2:
                 image_features = torch.flatten(image_features, 1)
             image_features = self.image_head(image_features)
+            image_logits = self.image_only_head(image_features).squeeze(1)
 
         tabular_features = self.tabular_encoder(tabular)
+        
+        # Modality dropout for tabular data during training
+        if self.training and torch.rand(1).item() < self.modality_dropout_prob:
+            tabular_features = torch.zeros_like(tabular_features)
+            
+        tabular_logits = self.tabular_only_head(tabular_features).squeeze(1)
+
         if self.fusion_mode == "cross_attention":
+            projected_tab = self.tab_to_fusion(tabular_features)
+            fused = self.cross_modal_fusion(image_features, projected_tab)
+        elif self.fusion_mode == "gmu":
             projected_tab = self.tab_to_fusion(tabular_features)
             fused = self.cross_modal_fusion(image_features, projected_tab)
         else:
             fused = torch.cat([image_features, tabular_features], dim=1)
 
         logits = self.fusion_head(fused).squeeze(1)
+        
+        if self.training:
+            return logits, image_logits, tabular_logits
         return logits
