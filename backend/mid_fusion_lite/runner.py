@@ -206,6 +206,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
         config.id_col,
         config.target_col,
         config.group_col,
+        "tbp_lv_nevi_confidence", # Ensure this is read for hard negative mining
         *config.categorical_cols,
         *requested_numeric_cols,
     }
@@ -350,10 +351,20 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             transforms=transforms["valid"],
         )
 
+        if "tbp_lv_nevi_confidence" in fold_train_df.columns:
+            # Nevus confidence: 0 (least likely nevus) to 100 (most likely nevus).
+            # Hard negatives are those with low nevus confidence (meaning they look like melanoma).
+            nevi_conf = fold_train_df["tbp_lv_nevi_confidence"].fillna(50.0).to_numpy()
+            # Add a base weight of 0.1 so easy negatives still have a chance of being sampled
+            hard_negative_weights = 0.1 + 0.9 * (((100.0 - nevi_conf) / 100.0) ** 2.0)
+        else:
+            hard_negative_weights = None
+
         sampler = make_balanced_sampler(
             targets=y_train,
             negative_ratio=config.negative_ratio,
             seed=config.seed + fold_index,
+            hard_negative_weights=hard_negative_weights,
         )
 
         train_loader = DataLoader(
@@ -423,8 +434,8 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
 
         n_pos = max(float(y_train.sum()), 1.0)
         n_neg = max(float(len(y_train) - y_train.sum()), 1.0)
-        # Class balancing via WeightedRandomSampler only (no double weighting)
-        pos_weight = 1.0  # No loss weighting, rely on sampler
+        # Restore double weighting: this is crucial for the partial AUC metric
+        pos_weight = np.sqrt(n_neg / n_pos)
 
         best_state, history, best_valid_score = fit_one_fold(
             model=model,

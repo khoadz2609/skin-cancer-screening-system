@@ -142,6 +142,7 @@ def make_balanced_sampler(
     targets: np.ndarray,
     negative_ratio: int,
     seed: int,
+    hard_negative_weights: np.ndarray | None = None,
 ) -> WeightedRandomSampler | None:
     labels = np.asarray(targets, dtype=np.int64)
     pos_mask = labels == 1
@@ -154,7 +155,19 @@ def make_balanced_sampler(
 
     weights = np.zeros(len(labels), dtype=np.float64)
     weights[pos_mask] = 1.0
-    weights[neg_mask] = (n_pos * max(1, negative_ratio)) / max(1, n_neg)
+
+    target_neg_sum = n_pos * max(1, negative_ratio)
+
+    if hard_negative_weights is not None:
+        neg_w = np.asarray(hard_negative_weights, dtype=np.float64)[neg_mask]
+        # Normalize the custom weights so their sum equals the desired total negative weight
+        if neg_w.sum() > 0:
+            neg_w = (neg_w / neg_w.sum()) * target_neg_sum
+        else:
+            neg_w = target_neg_sum / max(1, n_neg)
+        weights[neg_mask] = neg_w
+    else:
+        weights[neg_mask] = target_neg_sum / max(1, n_neg)
 
     num_samples = int(n_pos * (1 + max(1, negative_ratio)))
     generator = torch.Generator()
