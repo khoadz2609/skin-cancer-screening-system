@@ -145,6 +145,7 @@ DEFAULT_CATEGORICAL_COLS = [
 
 CONTEXT_NORM_SUFFIXES = [
     "patient_norm",  # Z-score normalized by patient
+    "patient_site_general_norm",  # Z-score normalized by anatomical site
 ]
 
 UGLY_DUCKLING_SOURCE_COLS = list(BASE_NUMERIC_COLS) + list(ENGINEERED_NUMERIC_COLS)
@@ -216,7 +217,10 @@ class MidFusionLiteConfig:
 
     backbone_name: str = "efficientnet_b0"
     use_feature_engineering: bool = True
+    use_contextual_group_norm_features: bool = True
     use_ugly_duckling_features: bool = True
+    use_anatomical_zscore_features: bool = True
+    use_area_aggregation_features: bool = True
     use_patient_post_processing: bool = True
     use_shades_of_gray: bool = True
     use_tabm_tabular: bool = True

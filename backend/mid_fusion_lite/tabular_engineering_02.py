@@ -75,6 +75,45 @@ def _add_ugly_duckling_features(
     generated_features["ud_consistency_location"] = ud_abs.std(axis=1)
 
 
+def _add_contextual_group_norm_features(
+    out: pd.DataFrame,
+    generated_features: dict[str, pd.Series],
+    group_col: str,
+    source_cols: list[str],
+    err: float,
+) -> None:
+    """Add features normalized by anatomical context (location/site).
+
+    Creates z-score normalized features grouped by patient AND anatomical location,
+    capturing how features deviate within anatomical regions.
+
+    Args:
+        out: DataFrame with all data.
+        generated_features: Dictionary to accumulate new features.
+        group_col: Grouping column (e.g., 'patient_id').
+        source_cols: Base columns to normalize.
+        err: Epsilon for numerical stability.
+    """
+    context_groups = [
+        ("patient_site_general_norm", "anatom_site_general"),
+    ]
+
+    for suffix, context_col in context_groups:
+        if context_col not in out.columns:
+            continue
+
+        # Pre-compute group statistics for ALL columns at once (cache-friendly)
+        grouped = out.groupby([group_col, context_col], observed=False, sort=False)
+
+        # Transform using cached statistics (vectorized)
+        for col in source_cols:
+            group_mean = grouped[col].transform("mean")
+            group_std = grouped[col].transform("std")
+            generated_features[f"{col}_{suffix}"] = (out[col] - group_mean) / (
+                group_std + err
+            )
+
+
 def _add_patient_lof_features(
     out: pd.DataFrame,
     generated_features: dict[str, pd.Series],
@@ -129,7 +168,10 @@ def _add_engineered_columns(
     group_col: str,
     categorical_cols: list[str],
     err: float,
+    use_contextual_group_norm_features: bool,
     use_ugly_duckling_features: bool,
+    use_anatomical_zscore_features: bool,
+    use_area_aggregation_features: bool,
 ) -> pd.DataFrame:
     """Main orchestrator for all feature engineering transformations.
 
@@ -148,7 +190,10 @@ def _add_engineered_columns(
         group_col: Column name for patient/group identifier.
         categorical_cols: Categorical column names for encoding.
         err: Epsilon for numerical stability (default: 1e-5).
+        use_contextual_group_norm_features: Enable location-based normalization.
         use_ugly_duckling_features: Enable anomaly detection features.
+        use_anatomical_zscore_features: Enable anatomical z-score features.
+        use_area_aggregation_features: Enable area aggregation by patient/anatomical site.
 
     Returns:
         DataFrame with original + all engineered features, numeric columns as float32.
@@ -402,6 +447,35 @@ def _add_engineered_columns(
             group_std + err
         )
 
+    if use_contextual_group_norm_features:
+        _add_contextual_group_norm_features(
+            out=out,
+            generated_features=generated_features,
+            group_col=group_col,
+            source_cols=source_cols,
+            err=err,
+        )
+
+    if use_area_aggregation_features and "tbp_lv_areaMM2" in out.columns:
+        generated_features["tbp_lv_areaMM2_patient"] = patient_grouped[
+            "tbp_lv_areaMM2"
+        ].transform("sum")
+        if "anatom_site_general" in out.columns:
+            generated_features["tbp_lv_areaMM2_bp"] = out.groupby(
+                [group_col, "anatom_site_general"], observed=False, sort=False
+            )["tbp_lv_areaMM2"].transform("sum")
+
+    if use_anatomical_zscore_features and "anatom_site_general" in out.columns:
+        site_grouped = out.groupby("anatom_site_general", observed=False, sort=False)
+        for col in ["tbp_lv_areaMM2", "tbp_lv_norm_border", "tbp_lv_norm_color"]:
+            if col not in out.columns:
+                continue
+            site_mean = site_grouped[col].transform("mean")
+            site_std = site_grouped[col].transform("std")
+            generated_features[f"{col}_anatomical_zscore"] = (out[col] - site_mean) / (
+                site_std + err
+            )
+
     if use_ugly_duckling_features:
         _add_ugly_duckling_features(
             out=out,
@@ -461,7 +535,10 @@ def add_feature_engineering(
     group_col: str,
     categorical_cols: list[str],
     err: float = 1e-5,
+    use_contextual_group_norm_features: bool = True,
     use_ugly_duckling_features: bool = True,
+    use_anatomical_zscore_features: bool = True,
+    use_area_aggregation_features: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Apply complete feature engineering pipeline to train and test sets.
 
@@ -474,7 +551,10 @@ def add_feature_engineering(
         group_col: Column name for grouping (e.g., 'patient_id').
         categorical_cols: List of categorical column names.
         err: Epsilon for numerical stability (default: 1e-5).
+        use_contextual_group_norm_features: Enable location-based normalization (default: True).
         use_ugly_duckling_features: Enable anomaly detection (default: True).
+        use_anatomical_zscore_features: Enable anatomical z-score (default: True).
+        use_area_aggregation_features: Enable area aggregation (default: True).
 
     Returns:
         Tuple of (train_enhanced, test_enhanced) DataFrames with all features.
@@ -484,13 +564,19 @@ def add_feature_engineering(
         group_col=group_col,
         categorical_cols=categorical_cols,
         err=err,
+        use_contextual_group_norm_features=use_contextual_group_norm_features,
         use_ugly_duckling_features=use_ugly_duckling_features,
+        use_anatomical_zscore_features=use_anatomical_zscore_features,
+        use_area_aggregation_features=use_area_aggregation_features,
     )
     test_enhanced = _add_engineered_columns(
         df=test_df,
         group_col=group_col,
         categorical_cols=categorical_cols,
         err=err,
+        use_contextual_group_norm_features=use_contextual_group_norm_features,
         use_ugly_duckling_features=use_ugly_duckling_features,
+        use_anatomical_zscore_features=use_anatomical_zscore_features,
+        use_area_aggregation_features=use_area_aggregation_features,
     )
     return train_enhanced, test_enhanced

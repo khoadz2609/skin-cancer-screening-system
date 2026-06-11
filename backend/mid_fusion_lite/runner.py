@@ -252,7 +252,10 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
                 test_df=test_df,
                 group_col=config.group_col,
                 categorical_cols=config.categorical_cols,
+                use_contextual_group_norm_features=bool(config.use_contextual_group_norm_features),
                 use_ugly_duckling_features=bool(config.use_ugly_duckling_features),
+                use_anatomical_zscore_features=bool(config.use_anatomical_zscore_features),
+                use_area_aggregation_features=bool(config.use_area_aggregation_features),
             )
         except MemoryError:
             print(
