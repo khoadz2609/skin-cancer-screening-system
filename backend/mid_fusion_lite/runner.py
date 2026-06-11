@@ -179,6 +179,21 @@ def _filter_supported_config_updates(
     return filtered
 
 
+def _apply_patient_post_processing(
+    preds: np.ndarray,
+    groups: np.ndarray,
+) -> np.ndarray:
+    """Normalize predictions patient-wise (using mean-subtraction).
+
+    This centers each patient's predictions around 0, putting outliers
+    above 0 and typical lesions below 0, aligning with the ugly duckling sign.
+    """
+    df = pd.DataFrame({"pred": preds, "group": groups})
+    group_mean = df.groupby("group", observed=False)["pred"].transform("mean")
+    processed = df["pred"] - group_mean
+    return processed.to_numpy()
+
+
 def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
     config = resolve_data_paths(config)
 
@@ -505,13 +520,30 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
 
     test_pred = test_pred_sum / float(n_test_ensembles)
 
-    if not np.any(oof_mask):
-        cv_pauc = float("nan")
+    # Apply Patient-wise Post-processing if configured
+    if bool(config.use_patient_post_processing):
+        print("Applying Patient-wise Post-processing on predictions...")
+        raw_cv_pauc = partial_auc_score(y[oof_mask], oof_pred[oof_mask]) if np.any(oof_mask) else float("nan")
+        
+        # Post-process OOF predictions
+        oof_pred_processed = _apply_patient_post_processing(oof_pred, train_df[config.group_col].to_numpy())
+        
+        # Calculate CV pAUC with post-processed predictions
+        cv_pauc = partial_auc_score(y[oof_mask], oof_pred_processed[oof_mask]) if np.any(oof_mask) else float("nan")
+        print(f"-> Raw OOF pAUC: {raw_cv_pauc:.6f} | Post-processed OOF pAUC: {cv_pauc:.6f}")
+        
+        # Post-process test predictions
+        test_pred = _apply_patient_post_processing(test_pred, test_df[config.group_col].to_numpy())
     else:
-        cv_pauc = partial_auc_score(y[oof_mask], oof_pred[oof_mask])
+        if not np.any(oof_mask):
+            cv_pauc = float("nan")
+        else:
+            cv_pauc = partial_auc_score(y[oof_mask], oof_pred[oof_mask])
 
     oof_df = train_df[[config.id_col, config.target_col]].copy()
     oof_df["oof_pred"] = oof_pred
+    if bool(config.use_patient_post_processing):
+        oof_df["oof_pred_processed"] = oof_pred_processed
     oof_df["used_in_cv"] = oof_mask.astype(int)
 
     submission_df = sample_submission.copy()
