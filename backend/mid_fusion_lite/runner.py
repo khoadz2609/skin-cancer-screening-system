@@ -339,6 +339,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             hdf5_path=config.train_hdf5_path,
             targets=y_train,
             transforms=transforms["train"],
+            use_shades_of_gray=bool(config.use_shades_of_gray),
         )
         valid_dataset = HDF5ImageTabularDataset(
             ids=fold_valid_df[config.id_col].astype(str).to_numpy(),
@@ -346,6 +347,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             hdf5_path=config.train_hdf5_path,
             targets=y_valid,
             transforms=transforms["valid"],
+            use_shades_of_gray=bool(config.use_shades_of_gray),
         )
         test_dataset = HDF5ImageTabularDataset(
             ids=test_df[config.id_col].astype(str).to_numpy(),
@@ -353,6 +355,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             hdf5_path=config.test_hdf5_path,
             targets=None,
             transforms=transforms["valid"],
+            use_shades_of_gray=bool(config.use_shades_of_gray),
         )
 
         if "tbp_lv_nevi_confidence" in fold_train_df.columns:

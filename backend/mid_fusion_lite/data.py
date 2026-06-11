@@ -11,6 +11,31 @@ from PIL import Image
 from torch.utils.data import Dataset, WeightedRandomSampler
 
 
+def shades_of_gray(img_rgb: np.ndarray, power: int = 6, gamma: float | None = None) -> np.ndarray:
+    """Apply Shades of Gray color constancy algorithm to normalize lighting."""
+    img_dtype = img_rgb.dtype
+    img_float = img_rgb.astype(np.float32)
+    
+    if gamma is not None:
+        img_float = np.power(img_float, gamma)
+        
+    img_power = np.power(img_float, power)
+    illum = np.power(np.mean(img_power, axis=(0, 1)), 1.0 / power)
+    
+    illum_norm = np.sqrt(np.sum(np.square(illum)))
+    if illum_norm > 0:
+        illum = illum / illum_norm
+        
+    mean_gray = 1.0 / np.sqrt(3.0)
+    
+    # Scale channels
+    scale = mean_gray / (illum + 1e-8)
+    img_normalized = img_float * scale[None, None, :]
+    
+    # Clip and cast
+    return np.clip(img_normalized, 0, 255).astype(img_dtype)
+
+
 def get_image_transforms(image_size: int) -> dict[str, A.Compose]:
     train_tfms = A.Compose(
         [  # type: ignore[arg-type]
@@ -64,6 +89,7 @@ class HDF5ImageTabularDataset(Dataset):
         targets: np.ndarray | None = None,
         transforms: A.Compose | None = None,
         cache_size: int = 1000,
+        use_shades_of_gray: bool = False,
     ) -> None:
         self.ids = np.asarray(ids).astype(str)
         self.tabular = np.asarray(tabular, dtype=np.float32)
@@ -75,6 +101,7 @@ class HDF5ImageTabularDataset(Dataset):
         self._h5: h5py.File | None = None
         self.cache_size = max(1, cache_size)
         self.image_cache: dict[str, np.ndarray] = {}
+        self.use_shades_of_gray = use_shades_of_gray
 
         if len(self.ids) != len(self.tabular):
             raise ValueError("ids and tabular must have the same length")
@@ -102,6 +129,9 @@ class HDF5ImageTabularDataset(Dataset):
 
         image = Image.open(BytesIO(binary)).convert("RGB")
         image_array = np.asarray(image)
+
+        if self.use_shades_of_gray:
+            image_array = shades_of_gray(image_array)
 
         # Cache image if space available (LRU-like strategy)
         if len(self.image_cache) < self.cache_size:
