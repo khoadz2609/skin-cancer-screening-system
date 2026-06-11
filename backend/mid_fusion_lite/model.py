@@ -185,6 +185,8 @@ class MidFusionLiteModel(nn.Module):
         train_image_backbone: bool = False,
         use_pretrained_backbone: bool = False,
         backbone_weights_path: str | None = None,
+        modality_dropout_prob: float = 0.15,
+        modality_mode: str = "both",
     ) -> None:
         super().__init__()
 
@@ -204,9 +206,7 @@ class MidFusionLiteModel(nn.Module):
                 parameter.requires_grad = False
 
         self.image_head = nn.Sequential(
-            # LazyLinear infers the true backbone output width at first forward pass.
-            # This avoids shape mismatches across timm backbones.
-            nn.LazyLinear(fusion_hidden_dim),
+            nn.Linear(self.image_encoder.num_features, fusion_hidden_dim),
             nn.GELU(),
             nn.Dropout(fusion_dropout),
         )
@@ -263,7 +263,10 @@ class MidFusionLiteModel(nn.Module):
 
         self.image_only_head = nn.Linear(fusion_hidden_dim, 1)
         self.tabular_only_head = nn.Linear(tab_hidden_dim, 1)
-        self.modality_dropout_prob = 0.15
+        self.modality_dropout_prob = modality_dropout_prob
+        self.modality_mode = str(modality_mode).strip().lower()
+        if self.modality_mode not in {"both", "image_only", "tabular_only"}:
+            raise ValueError("modality_mode must be: 'both', 'image_only', 'tabular_only'")
 
 
         self.fusion_head = nn.Sequential(
@@ -346,22 +349,38 @@ class MidFusionLiteModel(nn.Module):
         )
 
     def forward(self, images: torch.Tensor, tabular: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | torch.Tensor:
-        image_features = self.image_encoder(images)
-
-        if self.fusion_mode == "cross_attention":
-            if image_features.ndim == 4:
-                B, C, H, W = image_features.shape
-                image_features = image_features.view(B, C, -1).transpose(1, 2)
-            image_features = self.image_head(image_features)
+        # --- IMAGE BRANCH ---
+        # Skip image encoder if tabular_only to save massive computation time, 
+        # but only AFTER LazyLinear has been initialized (weight is no longer UninitializedParameter)
+        is_lazy_init = not isinstance(self.image_head[0].weight, torch.nn.parameter.UninitializedParameter)
+        
+        if self.modality_mode == "tabular_only" and is_lazy_init:
+            B = images.size(0)
+            fusion_dim = self.image_head[0].out_features
             
-            image_pooled = image_features.mean(dim=1) if image_features.ndim == 3 else image_features
-            image_logits = self.image_only_head(image_pooled).squeeze(1)
+            if self.fusion_mode == "cross_attention":
+                image_features = torch.zeros(B, 1, fusion_dim, device=images.device)
+            else:
+                image_features = torch.zeros(B, fusion_dim, device=images.device)
+            image_logits = torch.zeros(B, device=images.device)
         else:
-            if image_features.ndim > 2:
-                image_features = torch.flatten(image_features, 1)
-            image_features = self.image_head(image_features)
-            image_logits = self.image_only_head(image_features).squeeze(1)
+            image_features = self.image_encoder(images)
 
+            if self.fusion_mode == "cross_attention":
+                if image_features.ndim == 4:
+                    B, C, H, W = image_features.shape
+                    image_features = image_features.view(B, C, -1).transpose(1, 2)
+                image_features = self.image_head(image_features)
+                
+                image_pooled = image_features.mean(dim=1) if image_features.ndim == 3 else image_features
+                image_logits = self.image_only_head(image_pooled).squeeze(1)
+            else:
+                if image_features.ndim > 2:
+                    image_features = torch.flatten(image_features, 1)
+                image_features = self.image_head(image_features)
+                image_logits = self.image_only_head(image_features).squeeze(1)
+
+        # --- TABULAR BRANCH ---
         tabular_features = self.tabular_encoder(tabular)
         
         # Modality dropout for tabular data during training
@@ -369,6 +388,12 @@ class MidFusionLiteModel(nn.Module):
             tabular_features = torch.zeros_like(tabular_features)
             
         tabular_logits = self.tabular_only_head(tabular_features).squeeze(1)
+
+        # Modality isolation: zero out the inactive branch
+        if self.modality_mode == "tabular_only":
+            image_features = torch.zeros_like(image_features) if image_features.ndim == 2 else torch.zeros_like(image_features)
+        elif self.modality_mode == "image_only":
+            tabular_features = torch.zeros_like(tabular_features)
 
         if self.fusion_mode == "cross_attention":
             projected_tab = self.tab_to_fusion(tabular_features)

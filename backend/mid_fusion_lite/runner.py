@@ -237,18 +237,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
                 test_df=test_df,
                 group_col=config.group_col,
                 categorical_cols=config.categorical_cols,
-                use_contextual_group_norm_features=bool(
-                    config.use_contextual_group_norm_features
-                ),
                 use_ugly_duckling_features=bool(config.use_ugly_duckling_features),
-                use_anatomical_zscore_features=bool(
-                    config.use_anatomical_zscore_features
-                ),
-                use_area_aggregation_features=bool(
-                    config.use_area_aggregation_features
-                ),
-                use_patient_lof_features=bool(config.use_patient_lof_features),
-                patient_lof_min_group_size=int(config.patient_lof_min_group_size),
             )
         except MemoryError:
             print(
@@ -411,6 +400,8 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             train_image_backbone=config.train_image_backbone,
             use_pretrained_backbone=config.use_pretrained_backbone,
             backbone_weights_path=config.backbone_weights_path,
+            modality_dropout_prob=config.modality_dropout_prob,
+            modality_mode=config.modality_mode,
         )
         model = model.to(device)
         _initialize_lazy_parameters(
@@ -450,6 +441,8 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             use_amp=(config.use_amp and device.type == "cuda"),
             max_train_steps_per_epoch=config.max_train_steps_per_epoch,
             max_valid_steps=config.max_valid_steps,
+            aux_loss_image_weight=config.aux_loss_image_weight,
+            aux_loss_tab_weight=config.aux_loss_tab_weight,
         )
 
         model.load_state_dict(best_state)

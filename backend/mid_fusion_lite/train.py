@@ -67,6 +67,8 @@ def train_one_epoch(
     use_amp: bool,
     scaler: Any,
     max_steps: Optional[int] = None,
+    aux_loss_image_weight: float = 0.5,
+    aux_loss_tab_weight: float = 0.2,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -87,7 +89,7 @@ def train_one_epoch(
                 loss_fusion = criterion(fusion_logits, targets)
                 loss_image = criterion(image_logits, targets)
                 loss_tab = criterion(tab_logits, targets)
-                loss = loss_fusion + 0.5 * loss_image + 0.2 * loss_tab
+                loss = loss_fusion + aux_loss_image_weight * loss_image + aux_loss_tab_weight * loss_tab
             else:
                 loss = criterion(logits, targets)
 
@@ -217,6 +219,8 @@ def fit_one_fold(
     use_amp: bool,
     max_train_steps_per_epoch: Optional[int] = None,
     max_valid_steps: Optional[int] = None,
+    aux_loss_image_weight: float = 0.5,
+    aux_loss_tab_weight: float = 0.2,
 ) -> tuple[dict[str, torch.Tensor], list[dict[str, float]], float]:
     use_amp = bool(use_amp and device.type == "cuda")
     criterion = _build_criterion(pos_weight=pos_weight, device=device)
@@ -237,6 +241,8 @@ def fit_one_fold(
             use_amp=use_amp,
             scaler=scaler,
             max_steps=max_train_steps_per_epoch,
+            aux_loss_image_weight=aux_loss_image_weight,
+            aux_loss_tab_weight=aux_loss_tab_weight,
         )
 
         valid_stats = evaluate(

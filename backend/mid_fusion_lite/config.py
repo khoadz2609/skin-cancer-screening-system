@@ -145,8 +145,6 @@ DEFAULT_CATEGORICAL_COLS = [
 
 CONTEXT_NORM_SUFFIXES = [
     "patient_norm",  # Z-score normalized by patient
-    "patient_site_general_norm",  # Z-score normalized by anatomical site
-    # Removed: "patient_loc_norm", "patient_loc_sim_norm" (redundant, high correlation)
 ]
 
 UGLY_DUCKLING_SOURCE_COLS = list(BASE_NUMERIC_COLS) + list(ENGINEERED_NUMERIC_COLS)
@@ -218,12 +216,7 @@ class MidFusionLiteConfig:
 
     backbone_name: str = "efficientnet_b0"
     use_feature_engineering: bool = True
-    use_contextual_group_norm_features: bool = True
     use_ugly_duckling_features: bool = True
-    use_anatomical_zscore_features: bool = True
-    use_area_aggregation_features: bool = True
-    use_patient_lof_features: bool = False
-    patient_lof_min_group_size: int = 5
     use_tabm_tabular: bool = True
     use_null_importance_filter: bool = False
     null_importance_repeats: int = 8
@@ -242,6 +235,10 @@ class MidFusionLiteConfig:
     cross_attention_dropout: float = 0.1
     tab_dropout: float = 0.1
     fusion_dropout: float = 0.2
+    modality_dropout_prob: float = 0.15
+    aux_loss_image_weight: float = 0.5
+    aux_loss_tab_weight: float = 0.2
+    modality_mode: str = "both"  # "both" | "image_only" | "tabular_only"
     train_image_backbone: bool = False
     use_pretrained_backbone: bool = False
 

@@ -17,97 +17,6 @@ except ImportError:
     from config import BASE_NUMERIC_COLS, ENGINEERED_NUMERIC_COLS
 
 
-def _compute_patient_lof_feature(
-    df: pd.DataFrame,
-    group_col: str,
-    feature_cols: list[str],
-    min_group_size: int,
-) -> pd.Series:
-    """Compute Local Outlier Factor scores per patient group.
-
-    Args:
-        df: DataFrame with samples and features.
-        group_col: Column name for grouping (e.g., 'patient_id').
-        feature_cols: Feature columns to use for LOF computation.
-        min_group_size: Minimum samples per group to compute LOF.
-
-    Returns:
-        Series of LOF scores (higher = more anomalous) with same index as df.
-    """
-    scores = pd.Series(np.nan, index=df.index, dtype=np.float32)
-    grouped = df.groupby(group_col, observed=False, sort=False).groups
-
-    for _, group_index in grouped.items():
-        if len(group_index) < max(3, int(min_group_size)):
-            continue
-
-        n_neighbors = min(20, len(group_index) - 1)
-        if n_neighbors < 2:
-            continue
-
-        matrix = df.loc[group_index, feature_cols].to_numpy(dtype=np.float32, copy=True)
-        matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
-
-        try:
-            lof = LocalOutlierFactor(
-                n_neighbors=n_neighbors,
-                contamination="auto",
-            )
-            _ = lof.fit_predict(matrix)
-            scores.loc[group_index] = -lof.negative_outlier_factor_.astype(np.float32)
-        except ValueError:
-            continue
-
-    if scores.notna().any():
-        fill_value = float(scores.median(skipna=True))
-    else:
-        fill_value = 1.0
-    return scores.fillna(fill_value).astype(np.float32)
-
-
-def _add_contextual_group_norm_features(
-    out: pd.DataFrame,
-    generated_features: dict[str, pd.Series],
-    group_col: str,
-    source_cols: list[str],
-    err: float,
-) -> None:
-    """Add features normalized by anatomical context (location/site).
-
-    Creates z-score normalized features grouped by patient AND anatomical location,
-    capturing how features deviate within anatomical regions.
-
-    Args:
-        out: DataFrame with all data.
-        generated_features: Dictionary to accumulate new features.
-        group_col: Grouping column (e.g., 'patient_id').
-        source_cols: Base columns to normalize.
-        err: Epsilon for numerical stability.
-    """
-    context_groups = [
-        ("patient_site_general_norm", "anatom_site_general"),
-        # Removed: ("patient_loc_norm", "tbp_lv_location")
-        # Removed: ("patient_loc_sim_norm", "tbp_lv_location_simple")
-        # Reason: High correlation with patient_norm, redundant information
-    ]
-
-    for suffix, context_col in context_groups:
-        if context_col not in out.columns:
-            continue
-
-        # Pre-compute group statistics for ALL columns at once (cache-friendly)
-        grouped = out.groupby([group_col, context_col], observed=False, sort=False)
-        group_stats = grouped[source_cols].agg(['mean', 'std'])
-
-        # Transform using cached statistics (vectorized)
-        for col in source_cols:
-            group_mean = grouped[col].transform("mean")
-            group_std = grouped[col].transform("std")
-            generated_features[f"{col}_{suffix}"] = (out[col] - group_mean) / (
-                group_std + err
-            )
-
-
 def _add_ugly_duckling_features(
     out: pd.DataFrame,
     generated_features: dict[str, pd.Series],
@@ -166,17 +75,61 @@ def _add_ugly_duckling_features(
     generated_features["ud_consistency_location"] = ud_abs.std(axis=1)
 
 
+def _add_patient_lof_features(
+    out: pd.DataFrame,
+    generated_features: dict[str, pd.Series],
+    group_col: str,
+) -> None:
+    """Add Local Outlier Factor (LOF) score for each lesion per patient cohort.
+
+    The score indicates how much a lesion's visual/shape properties deviate from
+    the patient's typical lesions (acting as a multi-dimensional ugly duckling indicator).
+    """
+    lof_features = [
+        "clin_size_long_diam_mm",
+        "tbp_lv_areaMM2",
+        "tbp_lv_color_std_mean",
+        "tbp_lv_symm_2axis",
+        "tbp_lv_norm_border",
+        "tbp_lv_norm_color",
+    ]
+    # Filter only columns that exist in the dataframe
+    lof_features = [col for col in lof_features if col in out.columns]
+    if not lof_features:
+        generated_features["patient_lof_score"] = pd.Series(1.0, index=out.index)
+        return
+
+    # Fill NaNs/Infs for security
+    data_subset = out[[group_col] + lof_features].copy()
+    for col in lof_features:
+        data_subset[col] = data_subset[col].replace([np.inf, -np.inf], np.nan)
+        data_subset[col] = data_subset[col].fillna(data_subset[col].median())
+
+    scores = np.ones(len(out), dtype=np.float32)
+
+    # Group by patient
+    grouped = data_subset.groupby(group_col, observed=False, sort=False)
+    for _, group in grouped:
+        n_samples = len(group)
+        if n_samples >= 3:
+            n_neighbors = min(20, n_samples - 1)
+            if n_neighbors >= 2:
+                try:
+                    lof = LocalOutlierFactor(n_neighbors=n_neighbors, novelty=False)
+                    lof.fit(group[lof_features])
+                    scores[group.index] = -lof.negative_outlier_factor_
+                except Exception:
+                    pass
+
+    generated_features["patient_lof_score"] = pd.Series(scores, index=out.index)
+
+
 def _add_engineered_columns(
     df: pd.DataFrame,
     group_col: str,
     categorical_cols: list[str],
     err: float,
-    use_contextual_group_norm_features: bool,
     use_ugly_duckling_features: bool,
-    use_anatomical_zscore_features: bool,
-    use_area_aggregation_features: bool,
-    use_patient_lof_features: bool,
-    patient_lof_min_group_size: int,
 ) -> pd.DataFrame:
     """Main orchestrator for all feature engineering transformations.
 
@@ -195,12 +148,7 @@ def _add_engineered_columns(
         group_col: Column name for patient/group identifier.
         categorical_cols: Categorical column names for encoding.
         err: Epsilon for numerical stability (default: 1e-5).
-        use_contextual_group_norm_features: Enable location-based normalization.
         use_ugly_duckling_features: Enable anomaly detection features.
-        use_anatomical_zscore_features: Enable anatomical z-score features.
-        use_area_aggregation_features: Enable area aggregation by patient/anatomical site.
-        use_patient_lof_features: Enable Local Outlier Factor scoring.
-        patient_lof_min_group_size: Minimum group size for LOF computation.
 
     Returns:
         DataFrame with original + all engineered features, numeric columns as float32.
@@ -454,35 +402,6 @@ def _add_engineered_columns(
             group_std + err
         )
 
-    if use_contextual_group_norm_features:
-        _add_contextual_group_norm_features(
-            out=out,
-            generated_features=generated_features,
-            group_col=group_col,
-            source_cols=source_cols,
-            err=err,
-        )
-
-    if use_area_aggregation_features and "tbp_lv_areaMM2" in out.columns:
-        generated_features["tbp_lv_areaMM2_patient"] = patient_grouped[
-            "tbp_lv_areaMM2"
-        ].transform("sum")
-        if "anatom_site_general" in out.columns:
-            generated_features["tbp_lv_areaMM2_bp"] = out.groupby(
-                [group_col, "anatom_site_general"], observed=False, sort=False
-            )["tbp_lv_areaMM2"].transform("sum")
-
-    if use_anatomical_zscore_features and "anatom_site_general" in out.columns:
-        site_grouped = out.groupby("anatom_site_general", observed=False, sort=False)
-        for col in ["tbp_lv_areaMM2", "tbp_lv_norm_border", "tbp_lv_norm_color"]:
-            if col not in out.columns:
-                continue
-            site_mean = site_grouped[col].transform("mean")
-            site_std = site_grouped[col].transform("std")
-            generated_features[f"{col}_anatomical_zscore"] = (out[col] - site_mean) / (
-                site_std + err
-            )
-
     if use_ugly_duckling_features:
         _add_ugly_duckling_features(
             out=out,
@@ -491,31 +410,11 @@ def _add_engineered_columns(
             source_cols=source_cols,
             err=err,
         )
-
-    if use_patient_lof_features:
-        lof_feature_cols = [
-            col
-            for col in [
-                "tbp_lv_areaMM2",
-                "tbp_lv_perimeterMM",
-                "tbp_lv_norm_border",
-                "tbp_lv_norm_color",
-                "tbp_lv_H",
-                "tbp_lv_deltaLBnorm",
-                "lesion_color_difference",
-                "lesion_complexity_index",
-                "color_diversity_index",
-                "position_distance_3d",
-            ]
-            if col in out.columns
-        ]
-        if len(lof_feature_cols) >= 3:
-            generated_features["patient_lof_score"] = _compute_patient_lof_feature(
-                df=out,
-                group_col=group_col,
-                feature_cols=lof_feature_cols,
-                min_group_size=patient_lof_min_group_size,
-            )
+        _add_patient_lof_features(
+            out=out,
+            generated_features=generated_features,
+            group_col=group_col,
+        )
 
     for cat_col in categorical_cols:
         if cat_col not in out.columns:
@@ -562,12 +461,7 @@ def add_feature_engineering(
     group_col: str,
     categorical_cols: list[str],
     err: float = 1e-5,
-    use_contextual_group_norm_features: bool = True,
     use_ugly_duckling_features: bool = True,
-    use_anatomical_zscore_features: bool = True,
-    use_area_aggregation_features: bool = True,
-    use_patient_lof_features: bool = False,
-    patient_lof_min_group_size: int = 5,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Apply complete feature engineering pipeline to train and test sets.
 
@@ -580,12 +474,7 @@ def add_feature_engineering(
         group_col: Column name for grouping (e.g., 'patient_id').
         categorical_cols: List of categorical column names.
         err: Epsilon for numerical stability (default: 1e-5).
-        use_contextual_group_norm_features: Enable location-based normalization (default: True).
         use_ugly_duckling_features: Enable anomaly detection (default: True).
-        use_anatomical_zscore_features: Enable anatomical z-score (default: True).
-        use_area_aggregation_features: Enable area aggregation (default: True).
-        use_patient_lof_features: Enable LOF scoring (default: False).
-        patient_lof_min_group_size: Minimum group size for LOF (default: 5).
 
     Returns:
         Tuple of (train_enhanced, test_enhanced) DataFrames with all features.
@@ -595,23 +484,13 @@ def add_feature_engineering(
         group_col=group_col,
         categorical_cols=categorical_cols,
         err=err,
-        use_contextual_group_norm_features=use_contextual_group_norm_features,
         use_ugly_duckling_features=use_ugly_duckling_features,
-        use_anatomical_zscore_features=use_anatomical_zscore_features,
-        use_area_aggregation_features=use_area_aggregation_features,
-        use_patient_lof_features=use_patient_lof_features,
-        patient_lof_min_group_size=patient_lof_min_group_size,
     )
     test_enhanced = _add_engineered_columns(
         df=test_df,
         group_col=group_col,
         categorical_cols=categorical_cols,
         err=err,
-        use_contextual_group_norm_features=use_contextual_group_norm_features,
         use_ugly_duckling_features=use_ugly_duckling_features,
-        use_anatomical_zscore_features=use_anatomical_zscore_features,
-        use_area_aggregation_features=use_area_aggregation_features,
-        use_patient_lof_features=use_patient_lof_features,
-        patient_lof_min_group_size=patient_lof_min_group_size,
     )
     return train_enhanced, test_enhanced
