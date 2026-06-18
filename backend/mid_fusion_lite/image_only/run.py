@@ -28,6 +28,7 @@ def get_args():
     parser.add_argument("--image-size", type=int, default=224, help="Input resolution for image resizing")
     parser.add_argument("--pretrained", action="store_true", help="Load pretrained ImageNet weights")
     parser.add_argument("--weights-path", type=str, default=None, help="Load local model checkpoint (.pt)")
+    parser.add_argument("--backbone-weights-path", type=str, default=None, help="Path to pre-downloaded local backbone weights (.pth/.pt)")
     
     # Training hyperparameters
     parser.add_argument("--mode", type=str, choices=["train", "predict"], default="train", help="Mode: train a new model or run prediction")
@@ -141,7 +142,8 @@ def main():
             model = StandaloneImageModel(
                 backbone_name=args.backbone,
                 use_pretrained=args.pretrained,
-                weights_path=args.weights_path
+                weights_path=args.weights_path,
+                backbone_weights_path=args.backbone_weights_path
             )
             model = model.to(device)
             
@@ -227,7 +229,8 @@ def main():
         # Initialize Model
         model = StandaloneImageModel(
             backbone_name=args.backbone,
-            weights_path=args.weights_path
+            weights_path=args.weights_path,
+            backbone_weights_path=args.backbone_weights_path
         )
         model = model.to(device)
         
