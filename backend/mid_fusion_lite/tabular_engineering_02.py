@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import numpy as np
 import pandas as pd
 from sklearn.neighbors import LocalOutlierFactor
@@ -54,14 +55,14 @@ def _add_ugly_duckling_features(
 
     ud_loc_cols: list[str] = []
     for col in source_cols:
-        loc_mean = loc_grouped[col].transform("mean")
-        loc_std = loc_grouped[col].transform("std")
+        loc_mean = loc_grouped[col].transform("mean").astype(np.float32, copy=False)
+        loc_std = loc_grouped[col].transform("std").astype(np.float32, copy=False)
 
         ud_loc_col = f"ud_loc_{col}"
-        generated_features[ud_loc_col] = (out[col] - loc_mean) / (loc_std + err)
+        generated_features[ud_loc_col] = ((out[col] - loc_mean) / (loc_std + err)).astype(np.float32, copy=False)
         ud_loc_cols.append(ud_loc_col)
 
-        generated_features[f"ud_percentile_{col}"] = patient_grouped[col].rank(pct=True)
+        generated_features[f"ud_percentile_{col}"] = patient_grouped[col].rank(pct=True).astype(np.float32, copy=False)
 
     if not ud_loc_cols:
         return
@@ -107,11 +108,11 @@ def _add_contextual_group_norm_features(
 
         # Transform using cached statistics (vectorized)
         for col in source_cols:
-            group_mean = grouped[col].transform("mean")
-            group_std = grouped[col].transform("std")
-            generated_features[f"{col}_{suffix}"] = (out[col] - group_mean) / (
+            group_mean = grouped[col].transform("mean").astype(np.float32, copy=False)
+            group_std = grouped[col].transform("std").astype(np.float32, copy=False)
+            generated_features[f"{col}_{suffix}"] = ((out[col] - group_mean) / (
                 group_std + err
-            )
+            )).astype(np.float32, copy=False)
 
 
 def _add_patient_lof_features(
@@ -431,6 +432,11 @@ def _add_engineered_columns(
         axis=1,
         copy=False,
     )
+    # Cast all existing numeric columns to float32 early to save memory before heavy group normalization
+    num_cols = out.select_dtypes(include=[np.number]).columns
+    out[num_cols] = out[num_cols].astype(np.float32, copy=False)
+    gc.collect()
+
     patient_grouped = out.groupby(group_col, observed=False, sort=False)
 
     generated_features: dict[str, pd.Series] = {}
@@ -441,11 +447,11 @@ def _add_engineered_columns(
     ]
 
     for col in source_cols:
-        group_mean = patient_grouped[col].transform("mean")
-        group_std = patient_grouped[col].transform("std")
-        generated_features[f"{col}_patient_norm"] = (out[col] - group_mean) / (
+        group_mean = patient_grouped[col].transform("mean").astype(np.float32, copy=False)
+        group_std = patient_grouped[col].transform("std").astype(np.float32, copy=False)
+        generated_features[f"{col}_patient_norm"] = ((out[col] - group_mean) / (
             group_std + err
-        )
+        )).astype(np.float32, copy=False)
 
     if use_contextual_group_norm_features:
         _add_contextual_group_norm_features(
@@ -497,11 +503,11 @@ def _add_engineered_columns(
         for num_col in BASE_NUMERIC_COLS:
             if num_col not in out.columns:
                 continue
-            group_mean = grouped[num_col].transform("mean")
-            group_std = grouped[num_col].transform("std")
-            generated_features[f"{num_col}_{cat_col}"] = (out[num_col] - group_mean) / (
+            group_mean = grouped[num_col].transform("mean").astype(np.float32, copy=False)
+            group_std = grouped[num_col].transform("std").astype(np.float32, copy=False)
+            generated_features[f"{num_col}_{cat_col}"] = ((out[num_col] - group_mean) / (
                 group_std + err
-            )
+            )).astype(np.float32, copy=False)
 
     for col in categorical_cols:
         if col not in out.columns:
@@ -515,11 +521,18 @@ def _add_engineered_columns(
     )
 
     if generated_features:
+        # Explicitly cast all generated features to float32 before concatenating
+        for k in list(generated_features.keys()):
+            if np.issubdtype(generated_features[k].dtype, np.number):
+                generated_features[k] = generated_features[k].astype(np.float32, copy=False)
+        
         out = pd.concat(
             [out, pd.DataFrame(generated_features, index=out.index)],
             axis=1,
             copy=False,
         )
+        del generated_features
+        gc.collect()
 
     numeric_cols = out.select_dtypes(include=[np.number]).columns
     out[numeric_cols] = out[numeric_cols].replace([np.inf, -np.inf], np.nan)
