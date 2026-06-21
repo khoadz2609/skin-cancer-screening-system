@@ -320,6 +320,28 @@ class MidFusionLiteModel(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
 
+    def load_unimodal_weights(
+        self,
+        tabular_state: dict[str, torch.Tensor] | None = None,
+        image_state: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        """Load pretrained tabular and/or image branch weights from unimodal checkpoints."""
+        if tabular_state is not None:
+            filtered_tab_state = {}
+            for k, v in tabular_state.items():
+                if k.startswith("tabular_encoder."):
+                    filtered_tab_state[k] = v
+            missing, unexpected = self.load_state_dict(filtered_tab_state, strict=False)
+            print(f"Loaded pretrained tabular weights | missing={len(missing)} | unexpected={len(unexpected)}")
+
+        if image_state is not None:
+            filtered_img_state = {}
+            for k, v in image_state.items():
+                if k.startswith("image_encoder.") or k.startswith("image_head.") or k.startswith("image_only_head."):
+                    filtered_img_state[k] = v
+            missing, unexpected = self.load_state_dict(filtered_img_state, strict=False)
+            print(f"Loaded pretrained image weights | missing={len(missing)} | unexpected={len(unexpected)}")
+
     @staticmethod
     def _build_image_encoder(
         backbone_name: str,

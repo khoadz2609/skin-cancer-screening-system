@@ -194,6 +194,237 @@ def _apply_patient_post_processing(
     return processed.to_numpy()
 
 
+def _run_staged_training_for_fold(
+    fold_index: int,
+    config: MidFusionLiteConfig,
+    train_loader: DataLoader,
+    valid_loader: DataLoader,
+    device: torch.device,
+    pos_weight: float,
+    x_train_shape: int,
+    bins: Any,
+) -> tuple[dict[str, torch.Tensor], list[dict[str, float]], float]:
+    print(f"\n" + "=" * 80)
+    print(f"  >>> RUNNING 3-STAGE PROGRESSIVE TRAINING FOR FOLD {fold_index + 1} <<<")
+    print("=" * 80)
+
+    # =========================================================================
+    # STAGE 1: Tabular-Only Pretraining
+    # =========================================================================
+    print(f"\n[Stage 1] Pretraining Tabular encoder (epochs={config.stage1_epochs})...")
+    model_tab = MidFusionLiteModel(
+        backbone_name=config.backbone_name,
+        n_tab_features=x_train_shape,
+        use_tabm_tabular=config.use_tabm_tabular,
+        tab_hidden_dim=config.tab_hidden_dim,
+        tabm_arch_type=config.tabm_arch_type,
+        tabm_k=config.tabm_k,
+        tabm_n_blocks=config.tabm_n_blocks,
+        tabm_d_block=config.tabm_d_block,
+        fusion_hidden_dim=config.fusion_hidden_dim,
+        fusion_mode=config.fusion_mode,
+        cross_attention_heads=config.cross_attention_heads,
+        cross_attention_dropout=config.cross_attention_dropout,
+        tab_dropout=config.tab_dropout,
+        fusion_dropout=config.fusion_dropout,
+        train_image_backbone=False,
+        use_pretrained_backbone=False,
+        modality_dropout_prob=0.0,
+        modality_mode="tabular_only",
+        bins=bins,
+        d_embedding=config.d_embedding,
+        init_bias=None,
+    ).to(device)
+
+    _initialize_lazy_parameters(model_tab, device, config.image_size, x_train_shape)
+
+    opt_tab = torch.optim.AdamW(model_tab.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    best_tab_state, _, _ = fit_one_fold(
+        model=model_tab,
+        train_loader=train_loader,
+        valid_loader=valid_loader,
+        optimizer=opt_tab,
+        scheduler=None,
+        device=device,
+        epochs=config.stage1_epochs,
+        patience=config.patience,
+        pos_weight=pos_weight,
+        use_amp=(config.use_amp and device.type == "cuda"),
+        max_train_steps_per_epoch=config.max_train_steps_per_epoch,
+        max_valid_steps=config.max_valid_steps,
+        aux_loss_image_weight=0.0,
+        aux_loss_tab_weight=0.0,
+        gradient_clipping_norm=config.gradient_clipping_norm,
+        label_smoothing=config.label_smoothing,
+    )
+    del model_tab, opt_tab
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # =========================================================================
+    # STAGE 2: Image-Only Pretraining
+    # =========================================================================
+    print(f"\n[Stage 2] Pretraining Image encoder (epochs={config.stage2_epochs})...")
+    model_img = MidFusionLiteModel(
+        backbone_name=config.backbone_name,
+        n_tab_features=x_train_shape,
+        use_tabm_tabular=False,
+        tab_hidden_dim=config.tab_hidden_dim,
+        tabm_arch_type=config.tabm_arch_type,
+        tabm_k=config.tabm_k,
+        tabm_n_blocks=config.tabm_n_blocks,
+        tabm_d_block=config.tabm_d_block,
+        fusion_hidden_dim=config.fusion_hidden_dim,
+        fusion_mode=config.fusion_mode,
+        cross_attention_heads=config.cross_attention_heads,
+        cross_attention_dropout=config.cross_attention_dropout,
+        tab_dropout=config.tab_dropout,
+        fusion_dropout=config.fusion_dropout,
+        train_image_backbone=True,
+        use_pretrained_backbone=config.use_pretrained_backbone,
+        backbone_weights_path=config.backbone_weights_path,
+        modality_dropout_prob=0.0,
+        modality_mode="image_only",
+        bins=None,
+        d_embedding=config.d_embedding,
+        init_bias=None,
+    ).to(device)
+
+    _initialize_lazy_parameters(model_img, device, config.image_size, x_train_shape)
+
+    opt_img = torch.optim.AdamW(model_img.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    best_img_state, _, _ = fit_one_fold(
+        model=model_img,
+        train_loader=train_loader,
+        valid_loader=valid_loader,
+        optimizer=opt_img,
+        scheduler=None,
+        device=device,
+        epochs=config.stage2_epochs,
+        patience=config.patience,
+        pos_weight=pos_weight,
+        use_amp=(config.use_amp and device.type == "cuda"),
+        max_train_steps_per_epoch=config.max_train_steps_per_epoch,
+        max_valid_steps=config.max_valid_steps,
+        aux_loss_image_weight=0.0,
+        aux_loss_tab_weight=0.0,
+        gradient_clipping_norm=config.gradient_clipping_norm,
+        label_smoothing=config.label_smoothing,
+    )
+    del model_img, opt_img
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # =========================================================================
+    # STAGE 3: Fusion and Fine-Tuning
+    # =========================================================================
+    print(f"\n[Stage 3] Fusion & Fine-Tuning...")
+    init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
+    model = MidFusionLiteModel(
+        backbone_name=config.backbone_name,
+        n_tab_features=x_train_shape,
+        use_tabm_tabular=config.use_tabm_tabular,
+        tab_hidden_dim=config.tab_hidden_dim,
+        tabm_arch_type=config.tabm_arch_type,
+        tabm_k=config.tabm_k,
+        tabm_n_blocks=config.tabm_n_blocks,
+        tabm_d_block=config.tabm_d_block,
+        fusion_hidden_dim=config.fusion_hidden_dim,
+        fusion_mode=config.fusion_mode,
+        cross_attention_heads=config.cross_attention_heads,
+        cross_attention_dropout=config.cross_attention_dropout,
+        tab_dropout=config.tab_dropout,
+        fusion_dropout=config.fusion_dropout,
+        train_image_backbone=config.train_image_backbone,
+        use_pretrained_backbone=config.use_pretrained_backbone,
+        backbone_weights_path=config.backbone_weights_path,
+        modality_dropout_prob=config.modality_dropout_prob,
+        modality_mode="both",
+        bins=bins,
+        d_embedding=config.d_embedding,
+        init_bias=init_bias,
+    ).to(device)
+
+    _initialize_lazy_parameters(model, device, config.image_size, x_train_shape)
+
+    # Load pre-trained weights
+    model.load_unimodal_weights(
+        tabular_state=best_tab_state,
+        image_state=best_img_state,
+    )
+
+    # Stage 3A: Freeze encoders, train fusion head
+    print(f"\n  [Stage 3A] Freeze encoders, train fusion head (epochs={config.stage3_freeze_epochs})...")
+    for p in model.tabular_encoder.parameters():
+        p.requires_grad = False
+    for p in model.image_encoder.parameters():
+        p.requires_grad = False
+
+    fusion_params = [p for p in model.parameters() if p.requires_grad]
+    opt_fusion = torch.optim.AdamW(fusion_params, lr=config.lr, weight_decay=config.weight_decay)
+
+    best_fusion_state, history_a, best_score_a = fit_one_fold(
+        model=model,
+        train_loader=train_loader,
+        valid_loader=valid_loader,
+        optimizer=opt_fusion,
+        scheduler=None,
+        device=device,
+        epochs=config.stage3_freeze_epochs,
+        patience=config.patience,
+        pos_weight=pos_weight,
+        use_amp=(config.use_amp and device.type == "cuda"),
+        max_train_steps_per_epoch=config.max_train_steps_per_epoch,
+        max_valid_steps=config.max_valid_steps,
+        aux_loss_image_weight=config.aux_loss_image_weight,
+        aux_loss_tab_weight=config.aux_loss_tab_weight,
+        gradient_clipping_norm=config.gradient_clipping_norm,
+        label_smoothing=config.label_smoothing,
+    )
+
+    # Load best state from 3A and unfreeze for final fine-tuning
+    model.load_state_dict(best_fusion_state)
+
+    # Stage 3B: Unfreeze encoders, joint fine-tuning
+    print(f"\n  [Stage 3B] Unfreeze encoders, joint fine-tuning (epochs={config.stage3_unfreeze_epochs})...")
+    for p in model.tabular_encoder.parameters():
+        p.requires_grad = True
+    if config.train_image_backbone:
+        for p in model.image_encoder.parameters():
+            p.requires_grad = True
+
+    all_trainable = [p for p in model.parameters() if p.requires_grad]
+    opt_finetune = torch.optim.AdamW(all_trainable, lr=0.1 * config.lr, weight_decay=config.weight_decay)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt_finetune,
+        T_max=max(1, int(config.stage3_unfreeze_epochs)),
+        eta_min=config.min_lr,
+    )
+
+    best_final_state, history_b, best_score_b = fit_one_fold(
+        model=model,
+        train_loader=train_loader,
+        valid_loader=valid_loader,
+        optimizer=opt_finetune,
+        scheduler=scheduler,
+        device=device,
+        epochs=config.stage3_unfreeze_epochs,
+        patience=config.patience,
+        pos_weight=pos_weight,
+        use_amp=(config.use_amp and device.type == "cuda"),
+        max_train_steps_per_epoch=config.max_train_steps_per_epoch,
+        max_valid_steps=config.max_valid_steps,
+        aux_loss_image_weight=config.aux_loss_image_weight,
+        aux_loss_tab_weight=config.aux_loss_tab_weight,
+        gradient_clipping_norm=config.gradient_clipping_norm,
+        label_smoothing=config.label_smoothing,
+    )
+
+    combined_history = history_a + history_b
+    return best_final_state, combined_history, float(max(best_score_a, best_score_b))
+
+
 def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
     config = resolve_data_paths(config)
 
@@ -422,100 +653,139 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
                     b_wide[-1] += margin
                 bins.append(b_wide)
 
-        init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
-        model = MidFusionLiteModel(
-            backbone_name=config.backbone_name,
-            n_tab_features=x_train.shape[1],
-            use_tabm_tabular=config.use_tabm_tabular,
-            tab_hidden_dim=config.tab_hidden_dim,
-            tabm_arch_type=config.tabm_arch_type,
-            tabm_k=config.tabm_k,
-            tabm_n_blocks=config.tabm_n_blocks,
-            tabm_d_block=config.tabm_d_block,
-            fusion_hidden_dim=config.fusion_hidden_dim,
-            fusion_mode=config.fusion_mode,
-            cross_attention_heads=config.cross_attention_heads,
-            cross_attention_dropout=config.cross_attention_dropout,
-            tab_dropout=config.tab_dropout,
-            fusion_dropout=config.fusion_dropout,
-            train_image_backbone=config.train_image_backbone,
-            use_pretrained_backbone=config.use_pretrained_backbone,
-            backbone_weights_path=config.backbone_weights_path,
-            modality_dropout_prob=config.modality_dropout_prob,
-            modality_mode=config.modality_mode,
-            bins=bins,
-            d_embedding=config.d_embedding,
-            init_bias=init_bias,
-        )
-        model = model.to(device)
-        _initialize_lazy_parameters(
-            model=model,
-            device=device,
-            image_size=config.image_size,
-            n_tab_features=x_train.shape[1],
-        )
-
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=config.lr,
-            weight_decay=config.weight_decay,
-        )
-
-        warmup_epochs = int(config.warmup_epochs)
-        total_epochs = int(config.epochs)
-        if warmup_epochs > 0 and total_epochs > warmup_epochs:
-            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=0.1,
-                end_factor=1.0,
-                total_iters=warmup_epochs,
-            )
-            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=total_epochs - warmup_epochs,
-                eta_min=config.min_lr,
-            )
-            scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optimizer,
-                schedulers=[warmup_scheduler, cosine_scheduler],
-                milestones=[warmup_epochs],
-            )
-        else:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=max(1, total_epochs),
-                eta_min=config.min_lr,
-            )
-
         if config.pos_weight is not None:
             pos_weight = float(config.pos_weight)
         else:
             n_pos = max(float(y_train.sum()), 1.0)
             n_neg = max(float(len(y_train) - y_train.sum()), 1.0)
-            # Restore double weighting: this is crucial for the partial AUC metric
             pos_weight = np.sqrt(n_neg / n_pos)
 
-        best_state, history, best_valid_score = fit_one_fold(
-            model=model,
-            train_loader=train_loader,
-            valid_loader=valid_loader,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device=device,
-            epochs=config.epochs,
-            patience=config.patience,
-            pos_weight=pos_weight,
-            use_amp=(config.use_amp and device.type == "cuda"),
-            max_train_steps_per_epoch=config.max_train_steps_per_epoch,
-            max_valid_steps=config.max_valid_steps,
-            aux_loss_image_weight=config.aux_loss_image_weight,
-            aux_loss_tab_weight=config.aux_loss_tab_weight,
-            gradient_clipping_norm=config.gradient_clipping_norm,
-            label_smoothing=config.label_smoothing,
-        )
+        if bool(config.staged_training):
+            best_state, history, best_valid_score = _run_staged_training_for_fold(
+                fold_index=fold_index,
+                config=config,
+                train_loader=train_loader,
+                valid_loader=valid_loader,
+                device=device,
+                pos_weight=pos_weight,
+                x_train_shape=x_train.shape[1],
+                bins=bins,
+            )
+            
+            # Recreate model so we can load the best stage weights and run inference
+            init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
+            model = MidFusionLiteModel(
+                backbone_name=config.backbone_name,
+                n_tab_features=x_train.shape[1],
+                use_tabm_tabular=config.use_tabm_tabular,
+                tab_hidden_dim=config.tab_hidden_dim,
+                tabm_arch_type=config.tabm_arch_type,
+                tabm_k=config.tabm_k,
+                tabm_n_blocks=config.tabm_n_blocks,
+                tabm_d_block=config.tabm_d_block,
+                fusion_hidden_dim=config.fusion_hidden_dim,
+                fusion_mode=config.fusion_mode,
+                cross_attention_heads=config.cross_attention_heads,
+                cross_attention_dropout=config.cross_attention_dropout,
+                tab_dropout=config.tab_dropout,
+                fusion_dropout=config.fusion_dropout,
+                train_image_backbone=config.train_image_backbone,
+                use_pretrained_backbone=config.use_pretrained_backbone,
+                backbone_weights_path=config.backbone_weights_path,
+                modality_dropout_prob=config.modality_dropout_prob,
+                modality_mode="both",
+                bins=bins,
+                d_embedding=config.d_embedding,
+                init_bias=init_bias,
+            ).to(device)
+            _initialize_lazy_parameters(model, device, config.image_size, x_train.shape[1])
+            model.load_state_dict(best_state)
+        else:
+            init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
+            model = MidFusionLiteModel(
+                backbone_name=config.backbone_name,
+                n_tab_features=x_train.shape[1],
+                use_tabm_tabular=config.use_tabm_tabular,
+                tab_hidden_dim=config.tab_hidden_dim,
+                tabm_arch_type=config.tabm_arch_type,
+                tabm_k=config.tabm_k,
+                tabm_n_blocks=config.tabm_n_blocks,
+                tabm_d_block=config.tabm_d_block,
+                fusion_hidden_dim=config.fusion_hidden_dim,
+                fusion_mode=config.fusion_mode,
+                cross_attention_heads=config.cross_attention_heads,
+                cross_attention_dropout=config.cross_attention_dropout,
+                tab_dropout=config.tab_dropout,
+                fusion_dropout=config.fusion_dropout,
+                train_image_backbone=config.train_image_backbone,
+                use_pretrained_backbone=config.use_pretrained_backbone,
+                backbone_weights_path=config.backbone_weights_path,
+                modality_dropout_prob=config.modality_dropout_prob,
+                modality_mode=config.modality_mode,
+                bins=bins,
+                d_embedding=config.d_embedding,
+                init_bias=init_bias,
+            )
+            model = model.to(device)
+            _initialize_lazy_parameters(
+                model=model,
+                device=device,
+                image_size=config.image_size,
+                n_tab_features=x_train.shape[1],
+            )
 
-        model.load_state_dict(best_state)
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+            )
+
+            warmup_epochs = int(config.warmup_epochs)
+            total_epochs = int(config.epochs)
+            if warmup_epochs > 0 and total_epochs > warmup_epochs:
+                warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                    optimizer,
+                    start_factor=0.1,
+                    end_factor=1.0,
+                    total_iters=warmup_epochs,
+                )
+                cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=total_epochs - warmup_epochs,
+                    eta_min=config.min_lr,
+                )
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[warmup_scheduler, cosine_scheduler],
+                    milestones=[warmup_epochs],
+                )
+            else:
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=max(1, total_epochs),
+                    eta_min=config.min_lr,
+                )
+
+            best_state, history, best_valid_score = fit_one_fold(
+                model=model,
+                train_loader=train_loader,
+                valid_loader=valid_loader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                device=device,
+                epochs=config.epochs,
+                patience=config.patience,
+                pos_weight=pos_weight,
+                use_amp=(config.use_amp and device.type == "cuda"),
+                max_train_steps_per_epoch=config.max_train_steps_per_epoch,
+                max_valid_steps=config.max_valid_steps,
+                aux_loss_image_weight=config.aux_loss_image_weight,
+                aux_loss_tab_weight=config.aux_loss_tab_weight,
+                gradient_clipping_norm=config.gradient_clipping_norm,
+                label_smoothing=config.label_smoothing,
+            )
+            model.load_state_dict(best_state)
         predict_log_interval = max(1, int(config.predict_log_interval))
         if bool(config.show_predict_progress):
             print(
@@ -660,6 +930,11 @@ def main() -> None:
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--staged-training", action="store_true", default=False)
+    parser.add_argument("--stage1-epochs", type=int, default=None)
+    parser.add_argument("--stage2-epochs", type=int, default=None)
+    parser.add_argument("--stage3-freeze-epochs", type=int, default=None)
+    parser.add_argument("--stage3-unfreeze-epochs", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -678,6 +953,16 @@ def main() -> None:
         updates["epochs"] = args.epochs
     if args.image_size is not None:
         updates["image_size"] = args.image_size
+    if args.staged_training:
+        updates["staged_training"] = True
+    if args.stage1_epochs is not None:
+        updates["stage1_epochs"] = args.stage1_epochs
+    if args.stage2_epochs is not None:
+        updates["stage2_epochs"] = args.stage2_epochs
+    if args.stage3_freeze_epochs is not None:
+        updates["stage3_freeze_epochs"] = args.stage3_freeze_epochs
+    if args.stage3_unfreeze_epochs is not None:
+        updates["stage3_unfreeze_epochs"] = args.stage3_unfreeze_epochs
 
     if updates:
         filtered_updates = _filter_supported_config_updates(config, updates)

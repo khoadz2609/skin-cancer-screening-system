@@ -273,6 +273,12 @@ class MidFusionLiteConfig:
     train_hdf5_path: Optional[str] = None
     test_hdf5_path: Optional[str] = None
 
+    staged_training: bool = False
+    stage1_epochs: int = 5
+    stage2_epochs: int = 5
+    stage3_freeze_epochs: int = 3
+    stage3_unfreeze_epochs: int = 5
+
     numeric_cols: list[str] = field(default_factory=lambda: list(DEFAULT_NUMERIC_COLS))
     categorical_cols: list[str] = field(
         default_factory=lambda: list(DEFAULT_CATEGORICAL_COLS)
@@ -387,6 +393,10 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             use_pretrained_backbone=False,
             max_train_steps_per_epoch=80,
             max_valid_steps=40,
+            stage1_epochs=1,
+            stage2_epochs=1,
+            stage3_freeze_epochs=1,
+            stage3_unfreeze_epochs=1,
             output_dir="./mid_fusion_lite_outputs/smoke",
         )
 
@@ -413,6 +423,10 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             use_pretrained_backbone=False,
             max_train_steps_per_epoch=None,
             max_valid_steps=None,
+            stage1_epochs=5,
+            stage2_epochs=5,
+            stage3_freeze_epochs=3,
+            stage3_unfreeze_epochs=5,
             output_dir="./mid_fusion_lite_outputs/full_lite",
         )
 
@@ -432,6 +446,10 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
         lr=3e-4,  # Reduced from 5e-4: match full_lite for consistency
         weight_decay=1e-4,
         negative_ratio=6,
+        stage1_epochs=3,
+        stage2_epochs=3,
+        stage3_freeze_epochs=2,
+        stage3_unfreeze_epochs=3,
         backbone_name="efficientnet_b0",
         tab_hidden_dim=128,
         fusion_hidden_dim=192,
