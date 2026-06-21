@@ -279,6 +279,9 @@ class MidFusionLiteConfig:
     stage3_freeze_epochs: int = 3
     stage3_unfreeze_epochs: int = 5
 
+    pretrained_tabular_dir: Optional[str] = None
+    pretrained_image_dir: Optional[str] = None
+
     numeric_cols: list[str] = field(default_factory=lambda: list(DEFAULT_NUMERIC_COLS))
     categorical_cols: list[str] = field(
         default_factory=lambda: list(DEFAULT_CATEGORICAL_COLS)

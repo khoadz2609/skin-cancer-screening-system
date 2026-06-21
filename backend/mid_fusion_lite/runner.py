@@ -211,109 +211,129 @@ def _run_staged_training_for_fold(
     # =========================================================================
     # STAGE 1: Tabular-Only Pretraining
     # =========================================================================
-    print(f"\n[Stage 1] Pretraining Tabular encoder (epochs={config.stage1_epochs})...")
-    model_tab = MidFusionLiteModel(
-        backbone_name=config.backbone_name,
-        n_tab_features=x_train_shape,
-        use_tabm_tabular=config.use_tabm_tabular,
-        tab_hidden_dim=config.tab_hidden_dim,
-        tabm_arch_type=config.tabm_arch_type,
-        tabm_k=config.tabm_k,
-        tabm_n_blocks=config.tabm_n_blocks,
-        tabm_d_block=config.tabm_d_block,
-        fusion_hidden_dim=config.fusion_hidden_dim,
-        fusion_mode=config.fusion_mode,
-        cross_attention_heads=config.cross_attention_heads,
-        cross_attention_dropout=config.cross_attention_dropout,
-        tab_dropout=config.tab_dropout,
-        fusion_dropout=config.fusion_dropout,
-        train_image_backbone=False,
-        use_pretrained_backbone=False,
-        modality_dropout_prob=0.0,
-        modality_mode="tabular_only",
-        bins=bins,
-        d_embedding=config.d_embedding,
-        init_bias=None,
-    ).to(device)
+    best_tab_state = None
+    if config.pretrained_tabular_dir is not None:
+        tab_path = Path(config.pretrained_tabular_dir) / f"mid_fusion_lite_fold_{fold_index}.pt"
+        if tab_path.exists():
+            print(f"\n[Stage 1] Loading pre-trained tabular weights from checkpoint: {tab_path}")
+            best_tab_state = torch.load(tab_path, map_location="cpu", weights_only=True)
+        else:
+            print(f"\n[Stage 1] WARNING: Pretrained tabular checkpoint not found at {tab_path}. Training from scratch...")
 
-    _initialize_lazy_parameters(model_tab, device, config.image_size, x_train_shape)
+    if best_tab_state is None:
+        print(f"\n[Stage 1] Pretraining Tabular encoder (epochs={config.stage1_epochs})...")
+        model_tab = MidFusionLiteModel(
+            backbone_name=config.backbone_name,
+            n_tab_features=x_train_shape,
+            use_tabm_tabular=config.use_tabm_tabular,
+            tab_hidden_dim=config.tab_hidden_dim,
+            tabm_arch_type=config.tabm_arch_type,
+            tabm_k=config.tabm_k,
+            tabm_n_blocks=config.tabm_n_blocks,
+            tabm_d_block=config.tabm_d_block,
+            fusion_hidden_dim=config.fusion_hidden_dim,
+            fusion_mode=config.fusion_mode,
+            cross_attention_heads=config.cross_attention_heads,
+            cross_attention_dropout=config.cross_attention_dropout,
+            tab_dropout=config.tab_dropout,
+            fusion_dropout=config.fusion_dropout,
+            train_image_backbone=False,
+            use_pretrained_backbone=False,
+            modality_dropout_prob=0.0,
+            modality_mode="tabular_only",
+            bins=bins,
+            d_embedding=config.d_embedding,
+            init_bias=None,
+        ).to(device)
 
-    opt_tab = torch.optim.AdamW(model_tab.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    best_tab_state, _, _ = fit_one_fold(
-        model=model_tab,
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        optimizer=opt_tab,
-        scheduler=None,
-        device=device,
-        epochs=config.stage1_epochs,
-        patience=config.patience,
-        pos_weight=pos_weight,
-        use_amp=(config.use_amp and device.type == "cuda"),
-        max_train_steps_per_epoch=config.max_train_steps_per_epoch,
-        max_valid_steps=config.max_valid_steps,
-        aux_loss_image_weight=0.0,
-        aux_loss_tab_weight=0.0,
-        gradient_clipping_norm=config.gradient_clipping_norm,
-        label_smoothing=config.label_smoothing,
-    )
-    del model_tab, opt_tab
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        _initialize_lazy_parameters(model_tab, device, config.image_size, x_train_shape)
+
+        opt_tab = torch.optim.AdamW(model_tab.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        best_tab_state, _, _ = fit_one_fold(
+            model=model_tab,
+            train_loader=train_loader,
+            valid_loader=valid_loader,
+            optimizer=opt_tab,
+            scheduler=None,
+            device=device,
+            epochs=config.stage1_epochs,
+            patience=config.patience,
+            pos_weight=pos_weight,
+            use_amp=(config.use_amp and device.type == "cuda"),
+            max_train_steps_per_epoch=config.max_train_steps_per_epoch,
+            max_valid_steps=config.max_valid_steps,
+            aux_loss_image_weight=0.0,
+            aux_loss_tab_weight=0.0,
+            gradient_clipping_norm=config.gradient_clipping_norm,
+            label_smoothing=config.label_smoothing,
+        )
+        del model_tab, opt_tab
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # =========================================================================
     # STAGE 2: Image-Only Pretraining
     # =========================================================================
-    print(f"\n[Stage 2] Pretraining Image encoder (epochs={config.stage2_epochs})...")
-    model_img = MidFusionLiteModel(
-        backbone_name=config.backbone_name,
-        n_tab_features=x_train_shape,
-        use_tabm_tabular=False,
-        tab_hidden_dim=config.tab_hidden_dim,
-        tabm_arch_type=config.tabm_arch_type,
-        tabm_k=config.tabm_k,
-        tabm_n_blocks=config.tabm_n_blocks,
-        tabm_d_block=config.tabm_d_block,
-        fusion_hidden_dim=config.fusion_hidden_dim,
-        fusion_mode=config.fusion_mode,
-        cross_attention_heads=config.cross_attention_heads,
-        cross_attention_dropout=config.cross_attention_dropout,
-        tab_dropout=config.tab_dropout,
-        fusion_dropout=config.fusion_dropout,
-        train_image_backbone=True,
-        use_pretrained_backbone=config.use_pretrained_backbone,
-        backbone_weights_path=config.backbone_weights_path,
-        modality_dropout_prob=0.0,
-        modality_mode="image_only",
-        bins=None,
-        d_embedding=config.d_embedding,
-        init_bias=None,
-    ).to(device)
+    best_img_state = None
+    if config.pretrained_image_dir is not None:
+        img_path = Path(config.pretrained_image_dir) / f"mid_fusion_lite_fold_{fold_index}.pt"
+        if img_path.exists():
+            print(f"\n[Stage 2] Loading pre-trained image weights from checkpoint: {img_path}")
+            best_img_state = torch.load(img_path, map_location="cpu", weights_only=True)
+        else:
+            print(f"\n[Stage 2] WARNING: Pretrained image checkpoint not found at {img_path}. Training from scratch...")
 
-    _initialize_lazy_parameters(model_img, device, config.image_size, x_train_shape)
+    if best_img_state is None:
+        print(f"\n[Stage 2] Pretraining Image encoder (epochs={config.stage2_epochs})...")
+        model_img = MidFusionLiteModel(
+            backbone_name=config.backbone_name,
+            n_tab_features=x_train_shape,
+            use_tabm_tabular=False,
+            tab_hidden_dim=config.tab_hidden_dim,
+            tabm_arch_type=config.tabm_arch_type,
+            tabm_k=config.tabm_k,
+            tabm_n_blocks=config.tabm_n_blocks,
+            tabm_d_block=config.tabm_d_block,
+            fusion_hidden_dim=config.fusion_hidden_dim,
+            fusion_mode=config.fusion_mode,
+            cross_attention_heads=config.cross_attention_heads,
+            cross_attention_dropout=config.cross_attention_dropout,
+            tab_dropout=config.tab_dropout,
+            fusion_dropout=config.fusion_dropout,
+            train_image_backbone=True,
+            use_pretrained_backbone=config.use_pretrained_backbone,
+            backbone_weights_path=config.backbone_weights_path,
+            modality_dropout_prob=0.0,
+            modality_mode="image_only",
+            bins=None,
+            d_embedding=config.d_embedding,
+            init_bias=None,
+        ).to(device)
 
-    opt_img = torch.optim.AdamW(model_img.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    best_img_state, _, _ = fit_one_fold(
-        model=model_img,
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        optimizer=opt_img,
-        scheduler=None,
-        device=device,
-        epochs=config.stage2_epochs,
-        patience=config.patience,
-        pos_weight=pos_weight,
-        use_amp=(config.use_amp and device.type == "cuda"),
-        max_train_steps_per_epoch=config.max_train_steps_per_epoch,
-        max_valid_steps=config.max_valid_steps,
-        aux_loss_image_weight=0.0,
-        aux_loss_tab_weight=0.0,
-        gradient_clipping_norm=config.gradient_clipping_norm,
-        label_smoothing=config.label_smoothing,
-    )
-    del model_img, opt_img
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        _initialize_lazy_parameters(model_img, device, config.image_size, x_train_shape)
+
+        opt_img = torch.optim.AdamW(model_img.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        best_img_state, _, _ = fit_one_fold(
+            model=model_img,
+            train_loader=train_loader,
+            valid_loader=valid_loader,
+            optimizer=opt_img,
+            scheduler=None,
+            device=device,
+            epochs=config.stage2_epochs,
+            patience=config.patience,
+            pos_weight=pos_weight,
+            use_amp=(config.use_amp and device.type == "cuda"),
+            max_train_steps_per_epoch=config.max_train_steps_per_epoch,
+            max_valid_steps=config.max_valid_steps,
+            aux_loss_image_weight=0.0,
+            aux_loss_tab_weight=0.0,
+            gradient_clipping_norm=config.gradient_clipping_norm,
+            label_smoothing=config.label_smoothing,
+        )
+        del model_img, opt_img
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # =========================================================================
     # STAGE 3: Fusion and Fine-Tuning
@@ -935,6 +955,8 @@ def main() -> None:
     parser.add_argument("--stage2-epochs", type=int, default=None)
     parser.add_argument("--stage3-freeze-epochs", type=int, default=None)
     parser.add_argument("--stage3-unfreeze-epochs", type=int, default=None)
+    parser.add_argument("--pretrained-tabular-dir", default=None)
+    parser.add_argument("--pretrained-image-dir", default=None)
 
     args = parser.parse_args()
 
@@ -963,6 +985,10 @@ def main() -> None:
         updates["stage3_freeze_epochs"] = args.stage3_freeze_epochs
     if args.stage3_unfreeze_epochs is not None:
         updates["stage3_unfreeze_epochs"] = args.stage3_unfreeze_epochs
+    if args.pretrained_tabular_dir is not None:
+        updates["pretrained_tabular_dir"] = args.pretrained_tabular_dir
+    if args.pretrained_image_dir is not None:
+        updates["pretrained_image_dir"] = args.pretrained_image_dir
 
     if updates:
         filtered_updates = _filter_supported_config_updates(config, updates)
