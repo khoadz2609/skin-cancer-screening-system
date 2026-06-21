@@ -6,7 +6,7 @@ import os
 import random
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Callable
 
 os.environ.setdefault("ALBUMENTATIONS_DISABLE_VERSION_CHECK", "1")
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
@@ -445,7 +445,7 @@ def _run_staged_training_for_fold(
     return best_final_state, combined_history, float(max(best_score_a, best_score_b))
 
 
-def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
+def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Callable[[int, float], None]] = None) -> dict[str, Any]:
     config = resolve_data_paths(config)
 
     if config.backbone_weights_path and not Path(config.backbone_weights_path).exists():
@@ -804,6 +804,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
                 aux_loss_tab_weight=config.aux_loss_tab_weight,
                 gradient_clipping_norm=config.gradient_clipping_norm,
                 label_smoothing=config.label_smoothing,
+                epoch_callback=epoch_callback,
             )
             model.load_state_dict(best_state)
         predict_log_interval = max(1, int(config.predict_log_interval))
@@ -928,12 +929,13 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
 
 
 def run_with_preset(preset_name: str = "quick", **override_kwargs) -> dict[str, Any]:
+    epoch_callback = override_kwargs.pop("epoch_callback", None)
     config = get_preset_config(preset_name)
     if override_kwargs:
         filtered_updates = _filter_supported_config_updates(config, override_kwargs)
         if filtered_updates:
             config = config.with_updates(**filtered_updates)
-    return run_mid_fusion_cv(config)
+    return run_mid_fusion_cv(config, epoch_callback=epoch_callback)
 
 
 def main() -> None:

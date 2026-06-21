@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from contextlib import nullcontext
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 import numpy as np
 import torch
@@ -237,6 +237,7 @@ def fit_one_fold(
     aux_loss_tab_weight: float = 0.2,
     gradient_clipping_norm: Optional[float] = None,
     label_smoothing: float = 0.0,
+    epoch_callback: Optional[Callable[[int, float], None]] = None,
 ) -> tuple[dict[str, torch.Tensor], list[dict[str, float]], float]:
     use_amp = bool(use_amp and device.type == "cuda")
     criterion = _build_criterion(pos_weight=pos_weight, device=device)
@@ -296,6 +297,9 @@ def fit_one_fold(
             f"valid_auroc={valid_auroc:.5f} | "
             f"valid_pauc={valid_pauc:.5f}"
         )
+
+        if epoch_callback is not None:
+            epoch_callback(epoch, valid_pauc)
 
         if valid_pauc > best_score:
             best_score = valid_pauc
