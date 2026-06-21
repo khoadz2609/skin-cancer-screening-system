@@ -69,6 +69,8 @@ def train_one_epoch(
     max_steps: Optional[int] = None,
     aux_loss_image_weight: float = 0.5,
     aux_loss_tab_weight: float = 0.2,
+    gradient_clipping_norm: Optional[float] = None,
+    label_smoothing: float = 0.0,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -79,6 +81,11 @@ def train_one_epoch(
         tabular = batch["tabular"].to(device, non_blocking=True)
         targets = batch["target"].to(device, non_blocking=True)
 
+        if label_smoothing > 0.0:
+            targets_loss = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
+        else:
+            targets_loss = targets
+
         optimizer.zero_grad(set_to_none=True)
 
         with _autocast_context(device=device, use_amp=use_amp):
@@ -86,14 +93,19 @@ def train_one_epoch(
             
             if isinstance(logits, tuple) and len(logits) == 3:
                 fusion_logits, image_logits, tab_logits = logits
-                loss_fusion = criterion(fusion_logits, targets)
-                loss_image = criterion(image_logits, targets)
-                loss_tab = criterion(tab_logits, targets)
+                loss_fusion = criterion(fusion_logits, targets_loss)
+                loss_image = criterion(image_logits, targets_loss)
+                loss_tab = criterion(tab_logits, targets_loss)
                 loss = loss_fusion + aux_loss_image_weight * loss_image + aux_loss_tab_weight * loss_tab
             else:
-                loss = criterion(logits, targets)
+                loss = criterion(logits, targets_loss)
 
         scaler.scale(loss).backward()
+
+        if gradient_clipping_norm is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping_norm)
+
         scaler.step(optimizer)
         scaler.update()
 
@@ -221,6 +233,8 @@ def fit_one_fold(
     max_valid_steps: Optional[int] = None,
     aux_loss_image_weight: float = 0.5,
     aux_loss_tab_weight: float = 0.2,
+    gradient_clipping_norm: Optional[float] = None,
+    label_smoothing: float = 0.0,
 ) -> tuple[dict[str, torch.Tensor], list[dict[str, float]], float]:
     use_amp = bool(use_amp and device.type == "cuda")
     criterion = _build_criterion(pos_weight=pos_weight, device=device)
@@ -243,6 +257,8 @@ def fit_one_fold(
             max_steps=max_train_steps_per_epoch,
             aux_loss_image_weight=aux_loss_image_weight,
             aux_loss_tab_weight=aux_loss_tab_weight,
+            gradient_clipping_norm=gradient_clipping_norm,
+            label_smoothing=label_smoothing,
         )
 
         valid_stats = evaluate(

@@ -40,6 +40,8 @@ class TabMTabularEncoder(nn.Module):
         k: int,
         n_blocks: int,
         d_block: int,
+        bins: Optional[list[list[float]]] = None,
+        d_embedding: int = 24,
     ) -> None:
         super().__init__()
 
@@ -47,6 +49,16 @@ class TabMTabularEncoder(nn.Module):
             raise ImportError(
                 "TABM encoder requires package 'tabm'. "
                 "Install dependencies with: pip install tabm rtdl_num_embeddings"
+            )
+
+        num_embeddings = None
+        if bins is not None:
+            import rtdl_num_embeddings
+            num_embeddings = rtdl_num_embeddings.PiecewiseLinearEmbeddings(
+                bins,
+                d_embedding=d_embedding,
+                activation=False,
+                version='B',
             )
 
         self.encoder = TabM.make(
@@ -57,6 +69,7 @@ class TabMTabularEncoder(nn.Module):
             n_blocks=n_blocks,
             d_block=d_block,
             dropout=dropout,
+            num_embeddings=num_embeddings,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -187,6 +200,8 @@ class MidFusionLiteModel(nn.Module):
         backbone_weights_path: str | None = None,
         modality_dropout_prob: float = 0.15,
         modality_mode: str = "both",
+        bins: Optional[list[list[float]]] = None,
+        d_embedding: int = 24,
     ) -> None:
         super().__init__()
 
@@ -220,6 +235,8 @@ class MidFusionLiteModel(nn.Module):
                 k=tabm_k,
                 n_blocks=tabm_n_blocks,
                 d_block=tabm_d_block,
+                bins=bins,
+                d_embedding=d_embedding,
             )
         else:
             self.tabular_encoder = TabularEncoder(

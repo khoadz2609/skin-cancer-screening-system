@@ -248,6 +248,15 @@ class MidFusionLiteConfig:
     train_image_backbone: bool = False
     use_pretrained_backbone: bool = False
 
+    # Advanced Training Hyperparameters
+    warmup_epochs: int = 2
+    min_lr: float = 1e-6
+    gradient_clipping_norm: Optional[float] = 2.0
+    label_smoothing: float = 0.01
+    pos_weight: Optional[float] = None
+    n_bins: int = 96
+    d_embedding: int = 24
+
     use_amp: bool = True
     max_train_steps_per_epoch: Optional[int] = None
     max_valid_steps: Optional[int] = None
@@ -364,6 +373,9 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             train_batch_size=32,
             valid_batch_size=64,
             epochs=2,
+            warmup_epochs=0,
+            gradient_clipping_norm=None,
+            label_smoothing=0.0,
             patience=1,
             lr=8e-4,
             weight_decay=1e-4,
@@ -387,6 +399,7 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             train_batch_size=48,  # Increased from 32: larger batches for 10 epochs
             valid_batch_size=64,
             epochs=10,
+            warmup_epochs=2,
             patience=10,
             lr=3e-4,
             weight_decay=1e-4,  # Reduced from 2e-4: less regularization for longer training
@@ -414,6 +427,7 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
         train_batch_size=32,
         valid_batch_size=64,
         epochs=5,
+        warmup_epochs=1,
         patience=2,
         lr=3e-4,  # Reduced from 5e-4: match full_lite for consistency
         weight_decay=1e-4,

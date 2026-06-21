@@ -403,6 +403,15 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             drop_last=False,
         )
 
+        bins = None
+        if config.use_tabm_tabular:
+            import rtdl_num_embeddings
+            x_train_tensor = torch.tensor(x_train, dtype=torch.float32)
+            bins = rtdl_num_embeddings.compute_bins(
+                x_train_tensor,
+                n_bins=config.n_bins
+            )
+
         model = MidFusionLiteModel(
             backbone_name=config.backbone_name,
             n_tab_features=x_train.shape[1],
@@ -423,6 +432,8 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             backbone_weights_path=config.backbone_weights_path,
             modality_dropout_prob=config.modality_dropout_prob,
             modality_mode=config.modality_mode,
+            bins=bins,
+            d_embedding=config.d_embedding,
         )
         model = model.to(device)
         _initialize_lazy_parameters(
@@ -438,16 +449,40 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             lr=config.lr,
             weight_decay=config.weight_decay,
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(1, config.epochs),
-            eta_min=config.lr * 0.1,
-        )
 
-        n_pos = max(float(y_train.sum()), 1.0)
-        n_neg = max(float(len(y_train) - y_train.sum()), 1.0)
-        # Restore double weighting: this is crucial for the partial AUC metric
-        pos_weight = np.sqrt(n_neg / n_pos)
+        warmup_epochs = int(config.warmup_epochs)
+        total_epochs = int(config.epochs)
+        if warmup_epochs > 0 and total_epochs > warmup_epochs:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=total_epochs - warmup_epochs,
+                eta_min=config.min_lr,
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs],
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, total_epochs),
+                eta_min=config.min_lr,
+            )
+
+        if config.pos_weight is not None:
+            pos_weight = float(config.pos_weight)
+        else:
+            n_pos = max(float(y_train.sum()), 1.0)
+            n_neg = max(float(len(y_train) - y_train.sum()), 1.0)
+            # Restore double weighting: this is crucial for the partial AUC metric
+            pos_weight = np.sqrt(n_neg / n_pos)
 
         best_state, history, best_valid_score = fit_one_fold(
             model=model,
@@ -464,6 +499,8 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             max_valid_steps=config.max_valid_steps,
             aux_loss_image_weight=config.aux_loss_image_weight,
             aux_loss_tab_weight=config.aux_loss_tab_weight,
+            gradient_clipping_norm=config.gradient_clipping_norm,
+            label_smoothing=config.label_smoothing,
         )
 
         model.load_state_dict(best_state)
