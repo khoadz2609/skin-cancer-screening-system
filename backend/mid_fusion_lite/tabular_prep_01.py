@@ -11,16 +11,16 @@ except ImportError:
     from config import BASE_NUMERIC_COLS
 
 
-def _prepare_base_numeric(df: pd.DataFrame, err: float) -> pd.DataFrame:
+def _prepare_base_numeric(df: pd.DataFrame, err: float, medians: pd.Series | None = None) -> tuple[pd.DataFrame, pd.Series]:
     """Prepare numeric columns: convert types, handle missing values, and fix infinities.
 
     Args:
         df: Input DataFrame with potentially mixed types and missing values.
         err: Small epsilon value for numerical stability.
+        medians: Optional precomputed medians to fill NaNs. If None, computes from df.
 
     Returns:
-        DataFrame with numeric columns properly typed and cleaned (NaN-filled with medians,
-        infinities replaced, converted to float32).
+        Tuple of (DataFrame, Series of medians).
     """
     out = df.copy()
 
@@ -35,11 +35,14 @@ def _prepare_base_numeric(df: pd.DataFrame, err: float) -> pd.DataFrame:
 
     if base_cols:
         out[base_cols] = out[base_cols].replace([np.inf, -np.inf], np.nan)
-        medians = out[base_cols].median(numeric_only=True)
+        if medians is None:
+            medians = out[base_cols].median(numeric_only=True)
         out[base_cols] = out[base_cols].fillna(medians)
         out[base_cols] = out[base_cols].astype(np.float32, copy=False)
+    else:
+        medians = pd.Series(dtype=np.float32)
 
-    return out
+    return out, medians
 
 
 def _check_required_columns(df: pd.DataFrame, group_col: str) -> None:

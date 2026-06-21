@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from io import BytesIO
 
 import albumentations as A
@@ -99,6 +100,7 @@ class HDF5ImageTabularDataset(Dataset):
         self.hdf5_path = hdf5_path
         self.transforms = transforms
         self._h5: h5py.File | None = None
+        self._pid = os.getpid()
         self.cache_size = max(1, cache_size)
         self.image_cache: dict[str, np.ndarray] = {}
         self.use_shades_of_gray = use_shades_of_gray
@@ -112,8 +114,10 @@ class HDF5ImageTabularDataset(Dataset):
         return len(self.ids)
 
     def _get_h5(self) -> h5py.File:
-        if self._h5 is None:
+        current_pid = os.getpid()
+        if self._h5 is None or current_pid != self._pid:
             self._h5 = h5py.File(self.hdf5_path, "r")
+            self._pid = current_pid
         return self._h5
 
     def _read_image(self, isic_id: str) -> np.ndarray:

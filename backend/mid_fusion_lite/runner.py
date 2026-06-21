@@ -407,11 +407,22 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
         if config.use_tabm_tabular:
             import rtdl_num_embeddings
             x_train_tensor = torch.tensor(x_train, dtype=torch.float32)
-            bins = rtdl_num_embeddings.compute_bins(
+            raw_bins = rtdl_num_embeddings.compute_bins(
                 x_train_tensor,
                 n_bins=config.n_bins
             )
+            # Widen the extreme bin edges to prevent clipping test set outliers
+            bins = []
+            for b in raw_bins:
+                b_wide = b.clone()
+                if len(b_wide) > 1:
+                    span = b_wide[-1] - b_wide[0]
+                    margin = max(1e-3, float(0.1 * span))
+                    b_wide[0] -= margin
+                    b_wide[-1] += margin
+                bins.append(b_wide)
 
+        init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
         model = MidFusionLiteModel(
             backbone_name=config.backbone_name,
             n_tab_features=x_train.shape[1],
@@ -434,6 +445,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig) -> dict[str, Any]:
             modality_mode=config.modality_mode,
             bins=bins,
             d_embedding=config.d_embedding,
+            init_bias=init_bias,
         )
         model = model.to(device)
         _initialize_lazy_parameters(

@@ -208,7 +208,7 @@ class MidFusionLiteConfig:
     valid_batch_size: int = 64
     epochs: int = 6
     patience: int = 2
-    num_workers: int = 2
+    num_workers: int = 0
 
     lr: float = 3e-4
     weight_decay: float = 1e-4

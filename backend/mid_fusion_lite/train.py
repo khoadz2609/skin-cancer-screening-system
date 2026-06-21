@@ -53,9 +53,11 @@ def partial_auc_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(partial_auc)
 
 
-def _build_criterion(pos_weight: float, device: torch.device) -> nn.Module:
-    weight_tensor = torch.tensor([pos_weight], dtype=torch.float32, device=device)
-    return nn.BCEWithLogitsLoss(pos_weight=weight_tensor)
+def _build_criterion(pos_weight: Optional[float], device: torch.device) -> nn.Module:
+    if pos_weight is not None and pos_weight > 0:
+        weight_tensor = torch.tensor([pos_weight], dtype=torch.float32, device=device)
+        return nn.BCEWithLogitsLoss(pos_weight=weight_tensor)
+    return nn.BCEWithLogitsLoss()
 
 
 def train_one_epoch(
@@ -301,7 +303,7 @@ def fit_one_fold(
             bad_epochs = 0
         else:
             bad_epochs += 1
-            if bad_epochs > patience:
+            if bad_epochs >= patience:
                 print("Early stopping triggered.")
                 break
 

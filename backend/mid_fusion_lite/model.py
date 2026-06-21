@@ -94,8 +94,8 @@ class CrossModalAttentionFusion(nn.Module):
         self.image_norm = nn.LayerNorm(hidden_dim)
         self.tab_norm = nn.LayerNorm(hidden_dim)
 
-        # Bottleneck: compress image patches for efficient cross-modal fusion
-        self.image_bottleneck = nn.Linear(hidden_dim, hidden_dim)
+        # Bottleneck: compress tabular features for efficient cross-modal fusion
+        self.tab_bottleneck = nn.Linear(hidden_dim, hidden_dim)
 
         # Image patches attend to tabular bottleneck (weak direction)
         self.image_to_tab = nn.MultiheadAttention(
@@ -124,7 +124,7 @@ class CrossModalAttentionFusion(nn.Module):
         norm_tab = self.tab_norm(tab_token)
 
         # Bottleneck: create compressed representation of tabular info
-        tab_bottleneck = self.image_bottleneck(norm_tab)  # (B, 1, hidden_dim)
+        tab_bottleneck = self.tab_bottleneck(norm_tab)  # (B, 1, hidden_dim)
 
         # Image patches attend to compressed tabular bottleneck (weak direction)
         image_ctx, _ = self.image_to_tab(
@@ -202,6 +202,7 @@ class MidFusionLiteModel(nn.Module):
         modality_mode: str = "both",
         bins: Optional[list[list[float]]] = None,
         d_embedding: int = 24,
+        init_bias: Optional[float] = None,
     ) -> None:
         super().__init__()
 
@@ -216,6 +217,7 @@ class MidFusionLiteModel(nn.Module):
             fusion_mode=self.fusion_mode,
         )
 
+        self.train_image_backbone = train_image_backbone
         if not train_image_backbone:
             for parameter in self.image_encoder.parameters():
                 parameter.requires_grad = False
@@ -294,6 +296,30 @@ class MidFusionLiteModel(nn.Module):
             nn.Linear(fusion_hidden_dim, 1),
         )
 
+        # Custom weights initialization (avoiding pretrained backbone)
+        for m in [self.image_head, self.tabular_encoder, self.fusion_head, self.image_only_head, self.tabular_only_head]:
+            if m is not None:
+                self._init_custom_weights(m)
+        if self.cross_modal_fusion is not None:
+            self._init_custom_weights(self.cross_modal_fusion)
+        if isinstance(self.tab_to_fusion, nn.Linear):
+            self._init_custom_weights(self.tab_to_fusion)
+
+        if init_bias is not None:
+            nn.init.constant_(self.image_only_head.bias, init_bias)
+            nn.init.constant_(self.tabular_only_head.bias, init_bias)
+            nn.init.constant_(self.fusion_head[-1].bias, init_bias)
+
+    def _init_custom_weights(self, module: nn.Module) -> None:
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+
     @staticmethod
     def _build_image_encoder(
         backbone_name: str,
@@ -335,7 +361,7 @@ class MidFusionLiteModel(nn.Module):
         if not path.exists():
             raise FileNotFoundError(f"Backbone weights file not found: {weights_path}")
 
-        raw_obj = torch.load(path, map_location="cpu")
+        raw_obj = torch.load(path, map_location="cpu", weights_only=True)
         if isinstance(raw_obj, dict):
             if "state_dict" in raw_obj and isinstance(raw_obj["state_dict"], dict):
                 state_dict = raw_obj["state_dict"]
@@ -381,7 +407,12 @@ class MidFusionLiteModel(nn.Module):
                 image_features = torch.zeros(B, fusion_dim, device=images.device)
             image_logits = torch.zeros(B, device=images.device)
         else:
-            image_features = self.image_encoder(images)
+            if not self.train_image_backbone:
+                with torch.no_grad():
+                    image_features = self.image_encoder(images)
+            else:
+                image_features = self.image_encoder(images)
+            image_features = image_features.float()
 
             if self.fusion_mode == "cross_attention":
                 if image_features.ndim == 4:
@@ -400,15 +431,21 @@ class MidFusionLiteModel(nn.Module):
         # --- TABULAR BRANCH ---
         tabular_features = self.tabular_encoder(tabular)
         
-        # Modality dropout for tabular data during training
-        if self.training and torch.rand(1).item() < self.modality_dropout_prob:
-            tabular_features = torch.zeros_like(tabular_features)
+        # Modality dropout for tabular data during training (per-sample)
+        if self.training and self.modality_dropout_prob > 0.0:
+            mask = (
+                torch.rand(
+                    tabular_features.size(0), 1, device=tabular_features.device
+                )
+                >= self.modality_dropout_prob
+            ).float()
+            tabular_features = tabular_features * mask
             
         tabular_logits = self.tabular_only_head(tabular_features).squeeze(1)
 
         # Modality isolation: zero out the inactive branch
         if self.modality_mode == "tabular_only":
-            image_features = torch.zeros_like(image_features) if image_features.ndim == 2 else torch.zeros_like(image_features)
+            image_features = torch.zeros_like(image_features)
         elif self.modality_mode == "image_only":
             tabular_features = torch.zeros_like(tabular_features)
 

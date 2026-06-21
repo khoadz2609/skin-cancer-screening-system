@@ -157,7 +157,7 @@ def _add_patient_lof_features(
                 try:
                     lof = LocalOutlierFactor(n_neighbors=n_neighbors, novelty=False)
                     lof.fit(group[lof_features])
-                    scores[group.index] = -lof.negative_outlier_factor_
+                    scores[group.index.to_numpy()] = -lof.negative_outlier_factor_
                 except Exception:
                     pass
 
@@ -173,7 +173,8 @@ def _add_engineered_columns(
     use_ugly_duckling_features: bool,
     use_anatomical_zscore_features: bool,
     use_area_aggregation_features: bool,
-) -> pd.DataFrame:
+    train_stats: dict | None = None,
+) -> tuple[pd.DataFrame, dict]:
     """Main orchestrator for all feature engineering transformations.
 
     Generates 80+ derived features from base medical measurements including:
@@ -195,11 +196,21 @@ def _add_engineered_columns(
         use_ugly_duckling_features: Enable anomaly detection features.
         use_anatomical_zscore_features: Enable anatomical z-score features.
         use_area_aggregation_features: Enable area aggregation by patient/anatomical site.
+        train_stats: Precomputed training statistics (if None, computes them).
 
     Returns:
-        DataFrame with original + all engineered features, numeric columns as float32.
+        Tuple of (DataFrame with original + all engineered features, train_stats dictionary).
     """
-    out = _prepare_base_numeric(df=df, err=err)
+    train_stats_out = {}
+    if train_stats is None:
+        train_stats = {}
+
+    out, base_medians = _prepare_base_numeric(
+        df=df,
+        err=err,
+        medians=train_stats.get("base_medians"),
+    )
+    train_stats_out["base_medians"] = base_medians
     _check_required_columns(df=out, group_col=group_col)
 
     out["lesion_size_ratio"] = out["tbp_lv_minorAxisMM"] / (
@@ -472,15 +483,31 @@ def _add_engineered_columns(
             )["tbp_lv_areaMM2"].transform("sum")
 
     if use_anatomical_zscore_features and "anatom_site_general" in out.columns:
-        site_grouped = out.groupby("anatom_site_general", observed=False, sort=False)
+        site_stats = train_stats.get("site_stats")
+        train_site_stats = {}
         for col in ["tbp_lv_areaMM2", "tbp_lv_norm_border", "tbp_lv_norm_color"]:
             if col not in out.columns:
                 continue
-            site_mean = site_grouped[col].transform("mean")
-            site_std = site_grouped[col].transform("std")
+
+            if site_stats is None:
+                stats_df = out.groupby("anatom_site_general", observed=False, sort=False)[col].agg(["mean", "std"])
+                train_site_stats[col] = stats_df
+            else:
+                stats_df = site_stats[col]
+
+            # Map stats
+            site_mean = out["anatom_site_general"].map(stats_df["mean"]).astype(np.float32)
+            site_std = out["anatom_site_general"].map(stats_df["std"]).astype(np.float32)
+
+            # Fallbacks
+            site_mean = site_mean.fillna(out[col].mean())
+            site_std = site_std.fillna(0.0)
+
             generated_features[f"{col}_anatomical_zscore"] = (out[col] - site_mean) / (
                 site_std + err
             )
+
+        train_stats_out["site_stats"] = train_site_stats if site_stats is None else site_stats
 
     if use_ugly_duckling_features:
         _add_ugly_duckling_features(
@@ -519,6 +546,9 @@ def _add_engineered_columns(
     generated_features["count_per_patient"] = patient_grouped[group_col].transform(
         "count"
     )
+    generated_features["is_single_lesion_patient"] = (
+        generated_features["count_per_patient"] == 1
+    ).astype(np.float32)
 
     if generated_features:
         # Explicitly cast all generated features to float32 before concatenating
@@ -536,10 +566,24 @@ def _add_engineered_columns(
 
     numeric_cols = out.select_dtypes(include=[np.number]).columns
     out[numeric_cols] = out[numeric_cols].replace([np.inf, -np.inf], np.nan)
-    out[numeric_cols] = out[numeric_cols].fillna(out[numeric_cols].median())
+
+    engineered_medians = train_stats.get("engineered_medians")
+    if engineered_medians is None:
+        engineered_medians = out[numeric_cols].median(numeric_only=True)
+        train_stats_out["engineered_medians"] = engineered_medians
+    else:
+        train_stats_out["engineered_medians"] = engineered_medians
+
+    common_cols = numeric_cols.intersection(engineered_medians.index)
+    out[common_cols] = out[common_cols].fillna(engineered_medians[common_cols])
+
+    remaining_cols = numeric_cols.difference(engineered_medians.index)
+    if len(remaining_cols) > 0:
+        out[remaining_cols] = out[remaining_cols].fillna(out[remaining_cols].median())
+
     out[numeric_cols] = out[numeric_cols].astype(np.float32, copy=False)
 
-    return out
+    return out, train_stats_out
 
 
 def add_feature_engineering(
@@ -572,7 +616,7 @@ def add_feature_engineering(
     Returns:
         Tuple of (train_enhanced, test_enhanced) DataFrames with all features.
     """
-    train_enhanced = _add_engineered_columns(
+    train_enhanced, train_stats = _add_engineered_columns(
         df=train_df,
         group_col=group_col,
         categorical_cols=categorical_cols,
@@ -581,8 +625,9 @@ def add_feature_engineering(
         use_ugly_duckling_features=use_ugly_duckling_features,
         use_anatomical_zscore_features=use_anatomical_zscore_features,
         use_area_aggregation_features=use_area_aggregation_features,
+        train_stats=None,
     )
-    test_enhanced = _add_engineered_columns(
+    test_enhanced, _ = _add_engineered_columns(
         df=test_df,
         group_col=group_col,
         categorical_cols=categorical_cols,
@@ -591,5 +636,6 @@ def add_feature_engineering(
         use_ugly_duckling_features=use_ugly_duckling_features,
         use_anatomical_zscore_features=use_anatomical_zscore_features,
         use_area_aggregation_features=use_area_aggregation_features,
+        train_stats=train_stats,
     )
     return train_enhanced, test_enhanced

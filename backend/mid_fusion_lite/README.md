@@ -9,18 +9,28 @@ It is designed for quick experiments on Kaggle with lightweight presets.
 
 ## Files in this folder
 
-- `config.py`: presets and path resolution
-- `tabular.py`: fold-wise tabular preprocessing (leak-safe)
-- `data.py`: HDF5 image + tabular dataset, augmentations, balanced sampler
-- `model.py`: Mid Fusion Lite model
-- `train.py`: training loop, evaluation, pAUC metric
-- `runner.py`: CV training + OOF + submission export
+- `config.py`: presets, path resolution, and default hyperparameter configurations
+- `data.py`: HDF5 image + tabular dataset, augmentations (Albumentations), and balanced random sampler
+- `model.py`: Mid Fusion Lite model supporting GMU, Cross-Attention, and Concatenation fusion modes
+- `train.py`: training loop, evaluation, metric calculation (pAUC), and early stopping
+- `runner.py`: Cross-validation training orchestrator, OOF predictions, and submission export
+- `tabular_prep_01.py`: initial tabular preprocessing (conversions, medians, cleaning)
+- `tabular_engineering_02.py`: rich feature engineering (z-scores, LOF, contextual norms)
+- `tabular_selection_03.py`: null importance permutation-based feature selection
+- `tabular_preprocessor_04.py`: fold-wise tabular preprocessing (Standard scaling, one-hot encoding, quantile transformer)
 
 ## Presets
 
 - `smoke`: 1 fold only, very fast sanity run (EfficientNet-B0)
 - `quick`: 3 folds, lightweight model for rapid validation (EfficientNet-B0)
 - `full_lite`: 5 folds, still lightweight but stronger than quick (EfficientNet-B0)
+
+## Setup & Installation
+
+To run this pipeline locally, install dependencies using:
+```bash
+pip install -r requirements.txt
+```
 
 ## Kaggle usage (Notebook)
 

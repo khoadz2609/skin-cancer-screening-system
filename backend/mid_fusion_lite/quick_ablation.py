@@ -80,6 +80,7 @@ def _screen_base() -> dict:
         max_valid_steps=60,
         show_predict_progress=False,
         save_checkpoints=False,
+        num_workers=0,
         output_dir="./mid_fusion_lite_outputs/ablation_screen",
     )
     base.update(_get_data_paths())
@@ -112,6 +113,7 @@ def _confirm_base() -> dict:
         max_valid_steps=None,            # full validation
         show_predict_progress=False,
         save_checkpoints=False,
+        num_workers=0,
         output_dir="./mid_fusion_lite_outputs/ablation_confirm",
     )
     base.update(_get_data_paths())

@@ -181,7 +181,7 @@ class FoldTabularPreprocessor:
             base_matrix = self._transform_base(df)
 
             if len(base_matrix) >= 2:
-                n_quantiles = max(min(len(base_matrix) // 30, 1000), 10)
+                n_quantiles = max(min(len(base_matrix) // 30, 10000), 10)
                 n_quantiles = min(n_quantiles, len(base_matrix))
 
                 noise = (
