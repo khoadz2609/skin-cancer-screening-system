@@ -221,7 +221,6 @@ class MidFusionLiteConfig:
     use_ugly_duckling_features: bool = True
     use_anatomical_zscore_features: bool = True
     use_area_aggregation_features: bool = True
-    use_patient_post_processing: bool = True
     use_shades_of_gray: bool = True
     use_tabm_tabular: bool = True
     use_null_importance_filter: bool = False

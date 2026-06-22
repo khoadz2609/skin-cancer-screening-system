@@ -179,19 +179,7 @@ def _filter_supported_config_updates(
     return filtered
 
 
-def _apply_patient_post_processing(
-    preds: np.ndarray,
-    groups: np.ndarray,
-) -> np.ndarray:
-    """Normalize predictions patient-wise (using mean-subtraction).
 
-    This centers each patient's predictions around 0, putting outliers
-    above 0 and typical lesions below 0, aligning with the ugly duckling sign.
-    """
-    df = pd.DataFrame({"pred": preds, "group": groups})
-    group_mean = df.groupby("group", observed=False)["pred"].transform("mean")
-    processed = df["pred"] - group_mean
-    return processed.to_numpy()
 
 
 def _run_staged_training_for_fold(
@@ -248,11 +236,49 @@ def _run_staged_training_for_fold(
 
         _initialize_lazy_parameters(model_tab, device, config.image_size, x_train_shape)
 
+        # Optimize: Build temporary tabular-only datasets/loaders to bypass expensive image loading in Stage 1
+        train_ds_tab = HDF5ImageTabularDataset(
+            ids=train_loader.dataset.ids,
+            tabular=train_loader.dataset.tabular,
+            hdf5_path=train_loader.dataset.hdf5_path,
+            targets=train_loader.dataset.targets,
+            transforms=None,
+            use_shades_of_gray=False,
+            modality_mode="tabular_only",
+            image_size=config.image_size,
+        )
+        valid_ds_tab = HDF5ImageTabularDataset(
+            ids=valid_loader.dataset.ids,
+            tabular=valid_loader.dataset.tabular,
+            hdf5_path=valid_loader.dataset.hdf5_path,
+            targets=valid_loader.dataset.targets,
+            transforms=None,
+            use_shades_of_gray=False,
+            modality_mode="tabular_only",
+            image_size=config.image_size,
+        )
+        train_loader_tab = DataLoader(
+            train_ds_tab,
+            batch_size=train_loader.batch_size,
+            sampler=train_loader.sampler,
+            num_workers=train_loader.num_workers,
+            pin_memory=train_loader.pin_memory,
+            drop_last=train_loader.drop_last,
+        )
+        valid_loader_tab = DataLoader(
+            valid_ds_tab,
+            batch_size=valid_loader.batch_size,
+            sampler=None,
+            num_workers=valid_loader.num_workers,
+            pin_memory=valid_loader.pin_memory,
+            drop_last=False,
+        )
+
         opt_tab = torch.optim.AdamW(model_tab.parameters(), lr=config.lr, weight_decay=config.weight_decay)
         best_tab_state, _, _ = fit_one_fold(
             model=model_tab,
-            train_loader=train_loader,
-            valid_loader=valid_loader,
+            train_loader=train_loader_tab,
+            valid_loader=valid_loader_tab,
             optimizer=opt_tab,
             scheduler=None,
             device=device,
@@ -478,11 +504,10 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
     }
     requested_test_cols = {
         config.id_col,
+        config.group_col,
         *config.categorical_cols,
         *requested_numeric_cols,
     }
-    if bool(config.use_feature_engineering):
-        requested_test_cols.add(config.group_col)
 
     train_df = _read_csv_with_fallback(
         path=config.train_metadata_path,
@@ -594,6 +619,8 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             targets=y_train,
             transforms=transforms["train"],
             use_shades_of_gray=bool(config.use_shades_of_gray),
+            modality_mode=config.modality_mode,
+            image_size=config.image_size,
         )
         valid_dataset = HDF5ImageTabularDataset(
             ids=fold_valid_df[config.id_col].astype(str).to_numpy(),
@@ -602,6 +629,8 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             targets=y_valid,
             transforms=transforms["valid"],
             use_shades_of_gray=bool(config.use_shades_of_gray),
+            modality_mode=config.modality_mode,
+            image_size=config.image_size,
         )
         test_dataset = HDF5ImageTabularDataset(
             ids=test_df[config.id_col].astype(str).to_numpy(),
@@ -610,6 +639,8 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             targets=None,
             transforms=transforms["valid"],
             use_shades_of_gray=bool(config.use_shades_of_gray),
+            modality_mode=config.modality_mode,
+            image_size=config.image_size,
         )
 
         if "tbp_lv_nevi_confidence" in fold_train_df.columns:
@@ -857,7 +888,11 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             checkpoint_path = output_dir / f"mid_fusion_lite_fold_{fold_index}.pt"
             torch.save(best_state, checkpoint_path)
 
-        del model, optimizer, scheduler
+        del model
+        if "optimizer" in locals():
+            del optimizer
+        if "scheduler" in locals():
+            del scheduler
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -866,30 +901,13 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
 
     test_pred = test_pred_sum / float(n_test_ensembles)
 
-    # Apply Patient-wise Post-processing if configured
-    if bool(config.use_patient_post_processing):
-        print("Applying Patient-wise Post-processing on predictions...")
-        raw_cv_pauc = partial_auc_score(y[oof_mask], oof_pred[oof_mask]) if np.any(oof_mask) else float("nan")
-        
-        # Post-process OOF predictions
-        oof_pred_processed = _apply_patient_post_processing(oof_pred, train_df[config.group_col].to_numpy())
-        
-        # Calculate CV pAUC with post-processed predictions
-        cv_pauc = partial_auc_score(y[oof_mask], oof_pred_processed[oof_mask]) if np.any(oof_mask) else float("nan")
-        print(f"-> Raw OOF pAUC: {raw_cv_pauc:.6f} | Post-processed OOF pAUC: {cv_pauc:.6f}")
-        
-        # Post-process test predictions
-        test_pred = _apply_patient_post_processing(test_pred, test_df[config.group_col].to_numpy())
+    if not np.any(oof_mask):
+        cv_pauc = float("nan")
     else:
-        if not np.any(oof_mask):
-            cv_pauc = float("nan")
-        else:
-            cv_pauc = partial_auc_score(y[oof_mask], oof_pred[oof_mask])
+        cv_pauc = partial_auc_score(y[oof_mask], oof_pred[oof_mask])
 
     oof_df = train_df[[config.id_col, config.target_col]].copy()
     oof_df["oof_pred"] = oof_pred
-    if bool(config.use_patient_post_processing):
-        oof_df["oof_pred_processed"] = oof_pred_processed
     oof_df["used_in_cv"] = oof_mask.astype(int)
 
     submission_df = sample_submission.copy()

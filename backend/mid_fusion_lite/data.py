@@ -91,6 +91,8 @@ class HDF5ImageTabularDataset(Dataset):
         transforms: A.Compose | None = None,
         cache_size: int = 1000,
         use_shades_of_gray: bool = False,
+        modality_mode: str = "both",
+        image_size: int = 160,
     ) -> None:
         self.ids = np.asarray(ids).astype(str)
         self.tabular = np.asarray(tabular, dtype=np.float32)
@@ -104,6 +106,8 @@ class HDF5ImageTabularDataset(Dataset):
         self.cache_size = max(1, cache_size)
         self.image_cache: dict[str, np.ndarray] = {}
         self.use_shades_of_gray = use_shades_of_gray
+        self.modality_mode = str(modality_mode).strip().lower()
+        self.image_size = image_size
 
         if len(self.ids) != len(self.tabular):
             raise ValueError("ids and tabular must have the same length")
@@ -145,13 +149,17 @@ class HDF5ImageTabularDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         isic_id = self.ids[index]
-        image = self._read_image(isic_id)
         tabular = self.tabular[index]
 
-        if self.transforms is not None:
-            image = self.transforms(image=image)["image"]
+        if self.modality_mode == "tabular_only":
+            # Return a fast dummy zero tensor to bypass expensive image loading and resizing
+            image = torch.zeros(3, self.image_size, self.image_size, dtype=torch.float32)
         else:
-            image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+            image = self._read_image(isic_id)
+            if self.transforms is not None:
+                image = self.transforms(image=image)["image"]
+            else:
+                image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
 
         sample: dict[str, torch.Tensor | str] = {
             "image": image,
