@@ -140,7 +140,6 @@ DEFAULT_CATEGORICAL_COLS = [
     "tbp_tile_type",
     "tbp_lv_location",
     "tbp_lv_location_simple",
-    "attribution",
 ]
 
 CONTEXT_NORM_SUFFIXES = [
@@ -191,6 +190,61 @@ DEFAULT_NUMERIC_COLS = _deduplicate_keep_order(
 )
 
 
+def build_ablation_columns(
+    use_engineered_abcd: bool = True,
+    use_patient_norm: bool = True,
+    use_ugly_duckling_adv: bool = True,
+    use_categorical_context: bool = True,
+) -> tuple[list[str], list[str]]:
+    """Canonical numeric/categorical candidate lists for the ablation notebooks.
+
+    This is the SINGLE SOURCE OF TRUTH for the column set used by
+    ``only_mode/tabular_only_standard.ipynb`` and it MUST be reused verbatim by any
+    downstream stage (e.g. Stage-3 fusion) that loads a TabM checkpoint trained here.
+
+    Why order matters: TabM's Piecewise-Linear Embeddings bind weights to numeric
+    columns *by position*. A checkpoint trained on this exact ordered list will load
+    silently-wrong (weights mapped to the wrong column) — not just crash on a shape
+    mismatch — if the stage that consumes it rebuilds the columns in a different order.
+    So the ordering below intentionally mirrors the notebook's inline construction
+    exactly; do not "fix" it to match DEFAULT_NUMERIC_COLS.
+
+    Returns (numeric_candidates, categorical_candidates) as a SUPERSET; the runner's
+    ``select_available_columns`` still drops any candidate absent after FE.
+    """
+    src = list(BASE_NUMERIC_COLS) + list(ENGINEERED_NUMERIC_COLS)
+    anatomical_zscore = [c for c in ENGINEERED_NUMERIC_COLS if c.endswith("_anatomical_zscore")]
+    patient_variation = [c for c in ENGINEERED_NUMERIC_COLS if c.endswith("_patient_variation")]
+    area_agg = [c for c in ["tbp_lv_areaMM2_patient", "tbp_lv_areaMM2_bp"] if c in ENGINEERED_NUMERIC_COLS]
+    lof = [c for c in ["patient_lof_score"] if c in ENGINEERED_NUMERIC_COLS]
+    non_abcd = set(anatomical_zscore) | set(patient_variation) | set(area_agg) | set(lof)
+
+    num = list(BASE_NUMERIC_COLS)
+    if use_engineered_abcd:
+        num += [c for c in ENGINEERED_NUMERIC_COLS if c not in non_abcd]
+    if use_patient_norm:
+        num += [f"{c}_patient_norm" for c in src] + patient_variation
+    if use_ugly_duckling_adv:
+        num += (
+            list(UGLY_DUCKLING_NUMERIC_COLS)
+            + list(UGLY_DUCKLING_SUMMARY_COLS)
+            + lof
+            + anatomical_zscore
+            + area_agg
+        )
+    if use_categorical_context:
+        num += (
+            list(CATEGORICAL_COUNT_COLS)
+            + ["count_per_patient", "is_single_lesion_patient"]
+            + [f"{c}_patient_site_general_norm" for c in src]
+            + list(NUM_CAT_INTERACTION_COLS)
+        )
+        cat = list(DEFAULT_CATEGORICAL_COLS)
+    else:
+        cat = []
+    return _deduplicate_keep_order(num), list(cat)
+
+
 @dataclass(frozen=True)
 class MidFusionLiteConfig:
     seed: int = 42
@@ -202,6 +256,7 @@ class MidFusionLiteConfig:
 
     n_splits: int = 3
     fold_indices: Optional[list[int]] = None
+    fold_col: Optional[str] = "fold"
 
     image_size: int = 160
     train_batch_size: int = 32
@@ -210,8 +265,8 @@ class MidFusionLiteConfig:
     patience: int = 2
     num_workers: int = 0
 
-    lr: float = 3e-4
-    weight_decay: float = 1e-4
+    lr: float = 2.1e-4
+    weight_decay: float = 1.32e-4
 
     negative_ratio: int = 6
 
@@ -231,21 +286,21 @@ class MidFusionLiteConfig:
     quantile_noise_std: float = 1e-5
     tab_hidden_dim: int = 128
     tabm_arch_type: str = "tabm"
-    tabm_k: int = 16
-    tabm_n_blocks: int = 3
+    tabm_k: int = 32
+    tabm_n_blocks: int = 2
     tabm_d_block: int = 256
     fusion_hidden_dim: int = 256
     fusion_mode: str = "gmu"
     cross_attention_heads: int = 4
     cross_attention_dropout: float = 0.1
-    tab_dropout: float = 0.1
+    tab_dropout: float = 0.3
     fusion_dropout: float = 0.2
     modality_dropout_prob: float = 0.15
     aux_loss_image_weight: float = 0.5
     aux_loss_tab_weight: float = 0.2
     modality_mode: str = "both"  # "both" | "image_only" | "tabular_only"
     train_image_backbone: bool = False
-    use_pretrained_backbone: bool = False
+    download_pretrained_backbone: bool = False
 
     # Advanced Training Hyperparameters
     warmup_epochs: int = 2
@@ -253,8 +308,8 @@ class MidFusionLiteConfig:
     gradient_clipping_norm: Optional[float] = 2.0
     label_smoothing: float = 0.01
     pos_weight: Optional[float] = None
-    n_bins: int = 96
-    d_embedding: int = 24
+    n_bins: int = 48
+    d_embedding: int = 32
 
     use_amp: bool = True
     max_train_steps_per_epoch: Optional[int] = None
@@ -272,11 +327,28 @@ class MidFusionLiteConfig:
     train_hdf5_path: Optional[str] = None
     test_hdf5_path: Optional[str] = None
 
-    staged_training: bool = False
+    use_staged_pretraining: bool = False
+    # True  → 3-stage pipeline: pretrain tabular-only → pretrain image-only
+    #          → freeze encoders & train fusion head → joint fine-tune all
+    # False → end-to-end: initialise full fusion model and train all branches jointly from epoch 1
     stage1_epochs: int = 5
     stage2_epochs: int = 5
+    stage2_train_backbone: bool = True  # Whether to unfreeze backbone in Stage 2
     stage3_freeze_epochs: int = 3
     stage3_unfreeze_epochs: int = 5
+    # Learning rates for Stage 3A (frozen encoders, train fusion head only)
+    # and Stage 3B (unfreeze encoders, joint fine-tune).
+    # When None, stage3a_lr defaults to config.lr and stage3b_lr defaults to 0.1 * config.lr.
+    stage3a_lr: Optional[float] = None
+    stage3b_lr: Optional[float] = None
+    # In Stage 3B the image backbone is fine-tuned at stage3b_lr, while the newer
+    # tabular encoder + fusion head (which only trained briefly in Stage 3A) get a
+    # higher lr = stage3b_lr * stage3b_head_lr_mult so they keep learning instead of
+    # stalling at the backbone's tiny lr. Set to 1.0 to disable differential lr.
+    stage3b_head_lr_mult: float = 5.0
+
+    stage_to_run: str = "all"  # "all", "stage1", "stage2", "stage3"
+    tabular_full_data: bool = False
 
     pretrained_tabular_dir: Optional[str] = None
     pretrained_image_dir: Optional[str] = None
@@ -317,6 +389,8 @@ def resolve_data_paths(config: MidFusionLiteConfig) -> MidFusionLiteConfig:
     test_metadata = _first_existing(
         [
             Path("/kaggle/input/isic-2024-challenge/test-metadata.csv"),
+            Path("data/test-metadata.csv"),
+            Path("../data/test-metadata.csv"),
             Path("tests/test-metadata.csv"),
             Path("../tests/test-metadata.csv"),
         ]
@@ -324,6 +398,8 @@ def resolve_data_paths(config: MidFusionLiteConfig) -> MidFusionLiteConfig:
     sample_submission = _first_existing(
         [
             Path("/kaggle/input/isic-2024-challenge/sample_submission.csv"),
+            Path("data/sample_submission.csv"),
+            Path("../data/sample_submission.csv"),
             Path("tests/sample_submission.csv"),
             Path("../tests/sample_submission.csv"),
         ]
@@ -338,6 +414,8 @@ def resolve_data_paths(config: MidFusionLiteConfig) -> MidFusionLiteConfig:
     test_hdf5 = _first_existing(
         [
             Path("/kaggle/input/isic-2024-challenge/test-image.hdf5"),
+            Path("data/test-image.hdf5"),
+            Path("../data/test-image.hdf5"),
             Path("tests/test-image.hdf5"),
             Path("../tests/test-image.hdf5"),
         ]
@@ -370,36 +448,63 @@ def resolve_data_paths(config: MidFusionLiteConfig) -> MidFusionLiteConfig:
 
 
 def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
-    normalized = name.strip().lower()
+    normalized = name.lower().strip()
 
     if normalized == "smoke":
         return MidFusionLiteConfig(
             preset_name="smoke",
             n_splits=2,
             fold_indices=[0],
-            image_size=128,
-            train_batch_size=32,
-            valid_batch_size=64,
+            image_size=64,
+            train_batch_size=8,
+            valid_batch_size=16,
             epochs=2,
             warmup_epochs=0,
-            gradient_clipping_norm=None,
-            label_smoothing=0.0,
-            patience=1,
-            lr=8e-4,
-            weight_decay=1e-4,
-            negative_ratio=3,
-            backbone_name="efficientnet_b0",
-            tab_hidden_dim=96,
-            fusion_hidden_dim=128,
-            train_image_backbone=False,
-            use_pretrained_backbone=False,
-            max_train_steps_per_epoch=80,
-            max_valid_steps=40,
-            stage1_epochs=1,
             stage2_epochs=1,
             stage3_freeze_epochs=1,
             stage3_unfreeze_epochs=1,
             output_dir="./mid_fusion_lite_outputs/smoke",
+        )
+
+    if normalized == "kaggle_top1_fusion":
+        num, cat = build_ablation_columns(True, True, True, True)
+        return MidFusionLiteConfig(
+            preset_name="kaggle_top1_fusion",
+            numeric_cols=num,
+            categorical_cols=cat,
+            n_splits=5,
+            fold_indices=None,
+            image_size=224,
+            train_batch_size=48,
+            valid_batch_size=64,
+            epochs=12,
+            warmup_epochs=2,
+            patience=10,
+            lr=2.1e-4,
+            weight_decay=1.32e-4,
+            negative_ratio=5,
+            backbone_name="efficientnet_b0",
+            tab_hidden_dim=256,
+            fusion_hidden_dim=256,
+            fusion_mode="cross_attention",
+            tabm_k=32,
+            tabm_n_blocks=2,
+            tabm_d_block=256,
+            n_bins=48,
+            d_embedding=32,
+            tab_dropout=0.30,
+            fusion_dropout=0.25,
+            train_image_backbone=True,
+            download_pretrained_backbone=False,
+            max_train_steps_per_epoch=None,
+            max_valid_steps=None,
+            use_staged_pretraining=True,
+            stage1_epochs=5,
+            stage2_epochs=5,
+            stage2_train_backbone=False,
+            stage3_freeze_epochs=3,
+            stage3_unfreeze_epochs=5,
+            output_dir="./mid_fusion_lite_outputs/kaggle_top1_fusion",
         )
 
     if normalized == "full_lite":
@@ -408,32 +513,49 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             n_splits=5,
             fold_indices=None,
             image_size=192,
-            train_batch_size=48,  # Increased from 32: larger batches for 10 epochs
+            train_batch_size=48,
             valid_batch_size=64,
             epochs=10,
             warmup_epochs=2,
             patience=10,
-            lr=3e-4,
-            weight_decay=1e-4,  # Reduced from 2e-4: less regularization for longer training
+            lr=2.1e-4,
+            weight_decay=1.32e-4,
             negative_ratio=5,
             backbone_name="efficientnet_b0",
-            tab_hidden_dim=192,
+            tab_hidden_dim=128,
             fusion_hidden_dim=320,
-            tab_dropout=0.15,
+            tabm_k=32,
+            tabm_n_blocks=2,
+            tabm_d_block=256,
+            n_bins=48,
+            d_embedding=32,
+            tab_dropout=0.30,
             fusion_dropout=0.25,
             train_image_backbone=True,
-            use_pretrained_backbone=False,
+            download_pretrained_backbone=False,
             max_train_steps_per_epoch=None,
             max_valid_steps=None,
+            use_staged_pretraining=True,
             stage1_epochs=5,
             stage2_epochs=5,
+            stage2_train_backbone=False,  # Freeze backbone in Stage 2 (pretrained weights only)
             stage3_freeze_epochs=3,
             stage3_unfreeze_epochs=5,
             output_dir="./mid_fusion_lite_outputs/full_lite",
         )
 
+    if normalized == "image_only_train":
+        return MidFusionLiteConfig(
+            preset_name="image_only_train",
+            n_splits=5,
+            image_size=224,
+            backbone_name="efficientnet_b0",
+            modality_mode="image_only",
+            output_dir="./mid_fusion_lite_outputs/image_only_train",
+        )
+
     if normalized != "quick":
-        raise ValueError("Preset must be one of: smoke, quick, full_lite")
+        raise ValueError("Preset must be one of: smoke, quick, full_lite, image_only_train")
 
     return MidFusionLiteConfig(
         preset_name="quick",
@@ -458,7 +580,7 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
         tab_dropout=0.1,
         fusion_dropout=0.2,
         train_image_backbone=False,
-        use_pretrained_backbone=False,
+        download_pretrained_backbone=False,
         max_train_steps_per_epoch=180,
         max_valid_steps=80,
         output_dir="./mid_fusion_lite_outputs/quick",

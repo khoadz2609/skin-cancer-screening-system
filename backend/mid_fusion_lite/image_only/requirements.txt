@@ -1,8 +1,0 @@
-numpy
-pandas
-scikit-learn
-torch
-timm
-albumentations
-h5py
-Pillow

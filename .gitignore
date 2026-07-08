@@ -1,0 +1,45 @@
+# Python virtual environments & cache
+.venv/
+venv/
+ENV/
+env/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+**/.ipynb_checkpoints/
+**/.ipynb/
+
+# Large model weights and checkpoints (hosted on Kaggle)
+backend/models/*.pt
+backend/backbone_image/*.pt
+backend/preprocessor_cache/*.pkl
+
+# Web server temporary uploads & cache
+backend/static/uploads/*
+backend/static/session_images/*
+!backend/static/uploads/.gitkeep
+!backend/static/session_images/.gitkeep
+
+# Node.js dependencies & production builds
+node_modules/
+**/node_modules/
+frontend/dist/
+frontend/node_modules/
+frontend/.env
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+
+# IDEs & System files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+.DS_Store
+Thumbs.db

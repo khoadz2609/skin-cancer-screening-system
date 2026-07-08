@@ -1,0 +1,22 @@
+{
+  "metadata_mode": "processed",
+  "source": "optical_device",
+  "patient_code": "IP_6074337",
+  "isic_id": "ISIC_0015657",
+  "metadata": {
+    "isic_id": "ISIC_0015657",
+    "patient_id": "IP_6074337",
+    "age_approx": 45,
+    "sex": "male",
+    "anatom_site_general": "posterior torso",
+    "clin_size_long_diam_mm": 2.7,
+    "image_type": "TBP tile: close-up",
+    "tbp_tile_type": "3D: XP",
+    "tbp_lv_areaMM2": 3.846876,
+    "tbp_lv_perimeterMM": 9.387248,
+    "tbp_lv_location": "Torso Back Top Third",
+    "tbp_lv_location_simple": "Torso Back",
+    "attribution": "Memorial Sloan Kettering Cancer Center",
+    "copyright_license": "CC-BY"
+  }
+}

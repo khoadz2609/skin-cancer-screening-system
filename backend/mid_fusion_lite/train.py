@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from contextlib import nullcontext
-from typing import Any, Optional, Callable
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -78,6 +78,16 @@ def train_one_epoch(
     total_loss = 0.0
     seen = 0
 
+    def _compute_loss_with_ensemble(logits, targets_loss):
+        """Handle both regular [B] and ensemble [B, K] logits."""
+        if logits.ndim == 2:  # [B, K] ensemble
+            B, K = logits.shape
+            logits_flat = logits.reshape(-1)  # [B*K]
+            targets_flat = targets_loss.repeat_interleave(K)  # [B*K]
+            return criterion(logits_flat, targets_flat)
+        else:  # [B] regular
+            return criterion(logits, targets_loss)
+
     for step, batch in enumerate(loader):
         images = batch["image"].to(device, non_blocking=True)
         tabular = batch["tabular"].to(device, non_blocking=True)
@@ -92,15 +102,22 @@ def train_one_epoch(
 
         with _autocast_context(device=device, use_amp=use_amp):
             logits = model(images, tabular)
-            
+
             if isinstance(logits, tuple) and len(logits) == 3:
                 fusion_logits, image_logits, tab_logits = logits
-                loss_fusion = criterion(fusion_logits, targets_loss)
-                loss_image = criterion(image_logits, targets_loss)
-                loss_tab = criterion(tab_logits, targets_loss)
-                loss = loss_fusion + aux_loss_image_weight * loss_image + aux_loss_tab_weight * loss_tab
+
+                # Compute losses with ensemble support
+                loss_fusion = _compute_loss_with_ensemble(fusion_logits, targets_loss)
+                loss_image = _compute_loss_with_ensemble(image_logits, targets_loss)
+                loss_tab = _compute_loss_with_ensemble(tab_logits, targets_loss)
+
+                loss = (
+                    loss_fusion
+                    + aux_loss_image_weight * loss_image
+                    + aux_loss_tab_weight * loss_tab
+                )
             else:
-                loss = criterion(logits, targets_loss)
+                loss = _compute_loss_with_ensemble(logits, targets_loss)
 
         scaler.scale(loss).backward()
 
@@ -146,9 +163,18 @@ def evaluate(
 
         with _autocast_context(device=device, use_amp=use_amp):
             logits = model(images, tabular)
-            loss = criterion(logits, y)
 
-        prob = torch.sigmoid(logits)
+            # Handle ensemble logits [B, K] vs regular [B]
+            if isinstance(logits, torch.Tensor) and logits.ndim == 2:
+                # Loss: mean over the k independent predictions (matches training,
+                # see _compute_loss_with_ensemble) — NOT loss of the averaged logit.
+                K = logits.shape[1]
+                loss = criterion(logits.reshape(-1), y.repeat_interleave(K))
+                # Metric: average the k probabilities (TabM inference rule).
+                prob = torch.sigmoid(logits).mean(dim=1)
+            else:
+                loss = criterion(logits, y)
+                prob = torch.sigmoid(logits)
 
         preds.append(prob.detach().cpu().numpy())
         targets.append(y.detach().cpu().numpy())
@@ -208,7 +234,12 @@ def predict_loader(
         with _autocast_context(device=device, use_amp=use_amp):
             logits = model(images, tabular)
 
-        prob = torch.sigmoid(logits)
+        # Handle ensemble logits [B, K] vs regular [B]
+        if isinstance(logits, torch.Tensor) and logits.ndim == 2:
+            # Ensemble: average K probabilities
+            prob = torch.sigmoid(logits).mean(dim=1)
+        else:
+            prob = torch.sigmoid(logits)
         predictions.append(prob.detach().cpu().numpy())
 
         if progress_name and log_interval > 0:

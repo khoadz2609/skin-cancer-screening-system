@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
-from torch.utils.data import Dataset, WeightedRandomSampler
+from torch.utils.data import Dataset, Sampler
 
 
 def shades_of_gray(img_rgb: np.ndarray, power: int = 6, gamma: float | None = None) -> np.ndarray:
@@ -40,24 +40,54 @@ def shades_of_gray(img_rgb: np.ndarray, power: int = 6, gamma: float | None = No
 def get_image_transforms(image_size: int) -> dict[str, A.Compose]:
     train_tfms = A.Compose(
         [  # type: ignore[arg-type]
-            A.Resize(image_size, image_size),
+            # === GEOMETRIC — safe for ABCD criteria (Perez et al. 2018) ===
+            A.Transpose(p=0.5),
             A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.2),
+            A.VerticalFlip(p=0.5),
             A.ShiftScaleRotate(
-                shift_limit=0.06,
-                scale_limit=0.08,
-                rotate_limit=20,
+                shift_limit=0.1,
+                scale_limit=0.1,
+                rotate_limit=15,
                 border_mode=0,
-                p=0.6,
+                p=0.5,  # Reduced from 0.85
             ),
+            # === COLOR — most important augmentation group for dermoscopy ===
             A.RandomBrightnessContrast(
                 brightness_limit=0.2,
                 contrast_limit=0.2,
+                p=0.75,
+            ),
+            A.HueSaturationValue(
+                hue_shift_limit=10,
+                sat_shift_limit=20,
+                val_shift_limit=10,
                 p=0.5,
             ),
+            A.CLAHE(clip_limit=4.0, p=0.5),  # Reduced from 0.7
+            # === NOISE/BLUR — mild robustness, reduced probability ===
+            A.OneOf(
+                [
+                    A.MotionBlur(blur_limit=5),
+                    A.MedianBlur(blur_limit=5),
+                    A.GaussianBlur(blur_limit=5),
+                    A.GaussNoise(),
+                ],
+                p=0.3,  # Reduced from 0.7
+            ),
+            # REMOVED: OpticalDistortion, GridDistortion, ElasticTransform
+            # Reason: distort_limit=1.0 destroys Border and Structures (ABCD)
+            # and 2k images/epoch is insufficient to learn through heavy distortion
+            # === REGULARIZATION ===
+            A.Resize(image_size, image_size),
+            A.CoarseDropout(
+                num_holes_range=(1, 1),
+                hole_height_range=(1, max(2, int(image_size * 0.12))),  # Reduced from 0.25
+                hole_width_range=(1, max(2, int(image_size * 0.12))),   # Reduced from 0.25
+                p=0.4,  # Reduced from 0.7
+            ),
             A.Normalize(
-                mean=(0.485, 0.456, 0.406),
-                std=(0.229, 0.224, 0.225),
+                mean=(0.4815, 0.4578, 0.4082),
+                std=(0.2686, 0.2613, 0.2758),
                 max_pixel_value=255.0,
                 p=1.0,
             ),
@@ -69,8 +99,8 @@ def get_image_transforms(image_size: int) -> dict[str, A.Compose]:
         [  # type: ignore[arg-type]
             A.Resize(image_size, image_size),
             A.Normalize(
-                mean=(0.485, 0.456, 0.406),
-                std=(0.229, 0.224, 0.225),
+                mean=(0.4815, 0.4578, 0.4082),
+                std=(0.2686, 0.2613, 0.2758),
                 max_pixel_value=255.0,
                 p=1.0,
             ),
@@ -153,7 +183,7 @@ class HDF5ImageTabularDataset(Dataset):
 
         if self.modality_mode == "tabular_only":
             # Return a fast dummy zero tensor to bypass expensive image loading and resizing
-            image = torch.zeros(3, self.image_size, self.image_size, dtype=torch.float32)
+            image = torch.empty(0, dtype=torch.float32)
         else:
             image = self._read_image(isic_id)
             if self.transforms is not None:
@@ -180,44 +210,53 @@ class HDF5ImageTabularDataset(Dataset):
                 pass
 
 
+class EpochRandomUndersampler(Sampler):
+    """
+    Custom PyTorch Sampler that dynamically draws a new random subset of negative
+    indices at the start of every epoch, ensuring the model sees a varied negative
+    distribution over time without replacement within a single epoch.
+    """
+    def __init__(self, targets: np.ndarray, negative_ratio: float, seed: int):
+        labels = np.asarray(targets, dtype=np.int64)
+        self.pos_idx = np.where(labels == 1)[0].tolist()
+        self.neg_idx = np.where(labels == 0)[0].tolist()
+        
+        self.n_pos = len(self.pos_idx)
+        n_neg_sampled = int(self.n_pos * negative_ratio)
+        self.n_neg_sampled = min(n_neg_sampled, len(self.neg_idx))
+        
+        self.base_seed = seed
+        self.epoch = 0
+
+    def __iter__(self):
+        # We vary the seed per epoch to ensure different samples
+        rng = np.random.default_rng(self.base_seed + self.epoch)
+        self.epoch += 1
+        
+        if self.n_pos == 0 or len(self.neg_idx) == 0:
+            return iter([])
+
+        sampled_neg_idx = rng.choice(self.neg_idx, size=self.n_neg_sampled, replace=False).tolist()
+        
+        keep_idx = self.pos_idx + sampled_neg_idx
+        rng.shuffle(keep_idx)
+        return iter(keep_idx)
+
+    def __len__(self):
+        if self.n_pos == 0 or len(self.neg_idx) == 0:
+            return 0
+        return self.n_pos + self.n_neg_sampled
+
+
 def make_balanced_sampler(
     targets: np.ndarray,
-    negative_ratio: int,
+    negative_ratio: float,
     seed: int,
     hard_negative_weights: np.ndarray | None = None,
-) -> WeightedRandomSampler | None:
-    labels = np.asarray(targets, dtype=np.int64)
-    pos_mask = labels == 1
-    neg_mask = labels == 0
-
-    n_pos = int(pos_mask.sum())
-    n_neg = int(neg_mask.sum())
-    if n_pos == 0 or n_neg == 0:
+) -> Sampler | None:
+    """Returns an EpochRandomUndersampler for dynamically resampling negative class."""
+    sampler = EpochRandomUndersampler(targets, negative_ratio, seed)
+    if len(sampler) == 0:
         return None
+    return sampler
 
-    weights = np.zeros(len(labels), dtype=np.float64)
-    weights[pos_mask] = 1.0
-
-    target_neg_sum = n_pos * max(1, negative_ratio)
-
-    if hard_negative_weights is not None:
-        neg_w = np.asarray(hard_negative_weights, dtype=np.float64)[neg_mask]
-        # Normalize the custom weights so their sum equals the desired total negative weight
-        if neg_w.sum() > 0:
-            neg_w = (neg_w / neg_w.sum()) * target_neg_sum
-        else:
-            neg_w = target_neg_sum / max(1, n_neg)
-        weights[neg_mask] = neg_w
-    else:
-        weights[neg_mask] = target_neg_sum / max(1, n_neg)
-
-    num_samples = int(n_pos * (1 + max(1, negative_ratio)))
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-
-    return WeightedRandomSampler(
-        weights=torch.as_tensor(weights, dtype=torch.double),  # type: ignore[arg-type]
-        num_samples=num_samples,
-        replacement=True,
-        generator=generator,
-    )

@@ -1,0 +1,47 @@
+{
+  "preset": "kaggle_top1_fusion",
+  "cv_pauc": 0.17537310733862208,
+  "n_test_ensembles": 5,
+  "fold_metrics": [
+    {
+      "fold": 0,
+      "best_valid_pauc": 0.1708296067459438,
+      "fold_valid_pauc": 0.1708296067459438,
+      "n_train": 329895,
+      "n_valid": 71164,
+      "epochs_ran": 11
+    },
+    {
+      "fold": 1,
+      "best_valid_pauc": 0.17813564260145157,
+      "fold_valid_pauc": 0.17813564260145157,
+      "n_train": 313765,
+      "n_valid": 87294,
+      "epochs_ran": 12
+    },
+    {
+      "fold": 2,
+      "best_valid_pauc": 0.1879077785654443,
+      "fold_valid_pauc": 0.1879077785654443,
+      "n_train": 323414,
+      "n_valid": 77645,
+      "epochs_ran": 9
+    },
+    {
+      "fold": 3,
+      "best_valid_pauc": 0.1766492749899881,
+      "fold_valid_pauc": 0.1766492749899881,
+      "n_train": 317698,
+      "n_valid": 83361,
+      "epochs_ran": 11
+    },
+    {
+      "fold": 4,
+      "best_valid_pauc": 0.18704816616549616,
+      "fold_valid_pauc": 0.18704816616549616,
+      "n_train": 319464,
+      "n_valid": 81595,
+      "epochs_ran": 8
+    }
+  ]
+}

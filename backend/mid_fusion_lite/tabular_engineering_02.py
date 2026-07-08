@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+
 import numpy as np
 import pandas as pd
 from sklearn.neighbors import LocalOutlierFactor
@@ -55,25 +56,45 @@ def _add_ugly_duckling_features(
 
     ud_loc_cols: list[str] = []
     for col in source_cols:
-        loc_mean = loc_grouped[col].transform("mean").astype(np.float32, copy=False)
+        loc_sum = loc_grouped[col].transform("sum").astype(np.float32, copy=False)
+        loc_count = loc_grouped[col].transform("count").astype(np.float32, copy=False)
         loc_std = loc_grouped[col].transform("std").astype(np.float32, copy=False)
 
-        ud_loc_col = f"ud_loc_{col}"
-        generated_features[ud_loc_col] = ((out[col] - loc_mean) / (loc_std + err)).astype(np.float32, copy=False)
-        ud_loc_cols.append(ud_loc_col)
+        # 1. Leave-One-Out (LOO) Mean calculation
+        loo_mean = np.where(
+            loc_count > 1,
+            (loc_sum - out[col]) / (loc_count - 1),
+            out[col]
+        )
 
-        generated_features[f"ud_percentile_{col}"] = patient_grouped[col].rank(pct=True).astype(np.float32, copy=False)
+        # 2 & 3. Calculate distance with fallback to 0.0 for 1-lesion patients
+        ud_loc_col = f"ud_loc_{col}"
+        generated_features[ud_loc_col] = pd.Series(
+            np.where(
+                loc_count > 1,
+                (out[col] - loo_mean) / (loc_std + err),
+                0.0  # Fallback: strictly 0 (no deviation)
+            ),
+            index=out.index
+        ).astype(np.float32, copy=False)
+        ud_loc_cols.append(ud_loc_col)
 
     if not ud_loc_cols:
         return
 
+    # ud_abs intrinsically represents the standardized distance for each feature
     ud_abs = pd.DataFrame(
         {col: generated_features[col].abs() for col in ud_loc_cols},
         index=out.index,
     )
-    generated_features["ud_count_location"] = (ud_abs > 2.0).sum(axis=1)
-    generated_features["ud_max_severity_location"] = ud_abs.max(axis=1)
-    generated_features["ud_consistency_location"] = ud_abs.std(axis=1)
+    generated_features["ud_count_location"] = (ud_abs > 2.0).sum(axis=1).astype(np.float32)
+    generated_features["ud_max_severity_location"] = ud_abs.max(axis=1).astype(np.float32)
+    generated_features["ud_consistency_location"] = ud_abs.std(axis=1).fillna(0.0).astype(np.float32)
+    
+    # Add Euclidean distance of standardized features (Composite Score)
+    generated_features["ud_composite_distance"] = np.sqrt(
+        (ud_abs ** 2).sum(axis=1)
+    ).astype(np.float32)
 
 
 def _add_contextual_group_norm_features(
@@ -110,15 +131,17 @@ def _add_contextual_group_norm_features(
         for col in source_cols:
             group_mean = grouped[col].transform("mean").astype(np.float32, copy=False)
             group_std = grouped[col].transform("std").astype(np.float32, copy=False)
-            generated_features[f"{col}_{suffix}"] = ((out[col] - group_mean) / (
-                group_std + err
-            )).astype(np.float32, copy=False)
+            generated_features[f"{col}_{suffix}"] = (
+                (out[col] - group_mean) / (group_std + err)
+            ).astype(np.float32, copy=False)
 
 
 def _add_patient_lof_features(
     out: pd.DataFrame,
     generated_features: dict[str, pd.Series],
     group_col: str,
+    train_stats: dict | None = None,
+    train_stats_out: dict | None = None,
 ) -> None:
     """Add Local Outlier Factor (LOF) score for each lesion per patient cohort.
 
@@ -144,6 +167,28 @@ def _add_patient_lof_features(
     for col in lof_features:
         data_subset[col] = data_subset[col].replace([np.inf, -np.inf], np.nan)
         data_subset[col] = data_subset[col].fillna(data_subset[col].median())
+
+    # Standardize features using train_stats to avoid leakage and distribution shifts
+    if (
+        train_stats is not None
+        and "lof_mean" in train_stats
+        and "lof_std" in train_stats
+    ):
+        mean = train_stats["lof_mean"]
+        std = train_stats["lof_std"]
+    else:
+        mean = data_subset[lof_features].mean(numeric_only=True)
+        std = (
+            data_subset[lof_features]
+            .std(numeric_only=True)
+            .replace(0.0, 1.0)
+            .fillna(1.0)
+        )
+        if train_stats_out is not None:
+            train_stats_out["lof_mean"] = mean
+            train_stats_out["lof_std"] = std
+
+    data_subset[lof_features] = (data_subset[lof_features] - mean) / std
 
     scores = np.ones(len(out), dtype=np.float32)
 
@@ -458,11 +503,13 @@ def _add_engineered_columns(
     ]
 
     for col in source_cols:
-        group_mean = patient_grouped[col].transform("mean").astype(np.float32, copy=False)
+        group_mean = (
+            patient_grouped[col].transform("mean").astype(np.float32, copy=False)
+        )
         group_std = patient_grouped[col].transform("std").astype(np.float32, copy=False)
-        generated_features[f"{col}_patient_norm"] = ((out[col] - group_mean) / (
-            group_std + err
-        )).astype(np.float32, copy=False)
+        generated_features[f"{col}_patient_norm"] = (
+            (out[col] - group_mean) / (group_std + err)
+        ).astype(np.float32, copy=False)
 
     if use_contextual_group_norm_features:
         _add_contextual_group_norm_features(
@@ -490,14 +537,20 @@ def _add_engineered_columns(
                 continue
 
             if site_stats is None:
-                stats_df = out.groupby("anatom_site_general", observed=False, sort=False)[col].agg(["mean", "std"])
+                stats_df = out.groupby(
+                    "anatom_site_general", observed=False, sort=False
+                )[col].agg(["mean", "std"])
                 train_site_stats[col] = stats_df
             else:
                 stats_df = site_stats[col]
 
             # Map stats
-            site_mean = out["anatom_site_general"].map(stats_df["mean"]).astype(np.float32)
-            site_std = out["anatom_site_general"].map(stats_df["std"]).astype(np.float32)
+            site_mean = (
+                out["anatom_site_general"].map(stats_df["mean"]).astype(np.float32)
+            )
+            site_std = (
+                out["anatom_site_general"].map(stats_df["std"]).astype(np.float32)
+            )
 
             # Fallbacks
             site_mean = site_mean.fillna(out[col].mean())
@@ -507,7 +560,9 @@ def _add_engineered_columns(
                 site_std + err
             )
 
-        train_stats_out["site_stats"] = train_site_stats if site_stats is None else site_stats
+        train_stats_out["site_stats"] = (
+            train_site_stats if site_stats is None else site_stats
+        )
 
     if use_ugly_duckling_features:
         _add_ugly_duckling_features(
@@ -521,6 +576,8 @@ def _add_engineered_columns(
             out=out,
             generated_features=generated_features,
             group_col=group_col,
+            train_stats=train_stats,
+            train_stats_out=train_stats_out,
         )
 
     for cat_col in categorical_cols:
@@ -554,8 +611,10 @@ def _add_engineered_columns(
         # Explicitly cast all generated features to float32 before concatenating
         for k in list(generated_features.keys()):
             if np.issubdtype(generated_features[k].dtype, np.number):
-                generated_features[k] = generated_features[k].astype(np.float32, copy=False)
-        
+                generated_features[k] = generated_features[k].astype(
+                    np.float32, copy=False
+                )
+
         out = pd.concat(
             [out, pd.DataFrame(generated_features, index=out.index)],
             axis=1,
@@ -639,3 +698,66 @@ def add_feature_engineering(
         train_stats=train_stats,
     )
     return train_enhanced, test_enhanced
+
+
+def add_feature_engineering_folds(
+    fold_train_df: pd.DataFrame,
+    fold_valid_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    group_col: str,
+    categorical_cols: list[str],
+    err: float = 1e-5,
+    use_contextual_group_norm_features: bool = True,
+    use_ugly_duckling_features: bool = True,
+    use_anatomical_zscore_features: bool = True,
+    use_area_aggregation_features: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Leak-safe feature engineering for a single CV fold.
+
+    Unlike ``add_feature_engineering`` (which fits engineering statistics on the
+    whole training set), this fits **only on the fold-train split** and then applies
+    those frozen statistics to the fold-valid and test splits via ``train_stats``.
+
+    This matters because some engineered features are *global* statistics — anatomical
+    z-scores (``groupby("anatom_site_general")``), median imputation, and the LOF
+    standardization — which, if computed over train+valid together, leak validation
+    information into the features seen at validation time. Patient-grouped features
+    (``*_patient_norm``, ugly-duckling, area aggregation) are already leak-free as long
+    as folds are patient-disjoint, so they are unaffected either way.
+
+    Args:
+        fold_train_df: Training split for this fold (statistics are fit on this only).
+        fold_valid_df: Validation split for this fold (transform with fold-train stats).
+        test_df: Test set (transform with fold-train stats).
+        group_col: Column name for grouping (e.g., 'patient_id').
+        categorical_cols: List of categorical column names.
+        err: Epsilon for numerical stability (default: 1e-5).
+        use_contextual_group_norm_features: Enable location-based normalization.
+        use_ugly_duckling_features: Enable anomaly detection.
+        use_anatomical_zscore_features: Enable anatomical z-score.
+        use_area_aggregation_features: Enable area aggregation.
+
+    Returns:
+        Tuple of (train_enhanced, valid_enhanced, test_enhanced) DataFrames.
+    """
+    kwargs = dict(
+        group_col=group_col,
+        categorical_cols=categorical_cols,
+        err=err,
+        use_contextual_group_norm_features=use_contextual_group_norm_features,
+        use_ugly_duckling_features=use_ugly_duckling_features,
+        use_anatomical_zscore_features=use_anatomical_zscore_features,
+        use_area_aggregation_features=use_area_aggregation_features,
+    )
+    # Fit on fold-train ONLY; capture the frozen statistics.
+    train_enhanced, train_stats = _add_engineered_columns(
+        df=fold_train_df, train_stats=None, **kwargs
+    )
+    # Transform valid and test with the fold-train statistics (no leakage).
+    valid_enhanced, _ = _add_engineered_columns(
+        df=fold_valid_df, train_stats=train_stats, **kwargs
+    )
+    test_enhanced, _ = _add_engineered_columns(
+        df=test_df, train_stats=train_stats, **kwargs
+    )
+    return train_enhanced, valid_enhanced, test_enhanced

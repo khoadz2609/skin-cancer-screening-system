@@ -4,6 +4,7 @@ import gc
 import json
 import os
 import random
+import re
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Optional, Callable
@@ -30,7 +31,7 @@ try:
         get_image_transforms,
         make_balanced_sampler,
     )
-    from .tabular_engineering_02 import add_feature_engineering
+    from .tabular_engineering_02 import add_feature_engineering_folds
     from .model import MidFusionLiteModel
     from .tabular_preprocessor_04 import FoldTabularPreprocessor, select_available_columns
     from .train import fit_one_fold, partial_auc_score, predict_loader
@@ -46,10 +47,44 @@ except ImportError:
         get_image_transforms,
         make_balanced_sampler,
     )
-    from tabular_engineering_02 import add_feature_engineering
+    from tabular_engineering_02 import add_feature_engineering_folds
     from model import MidFusionLiteModel
     from tabular_preprocessor_04 import FoldTabularPreprocessor, select_available_columns
     from train import fit_one_fold, partial_auc_score, predict_loader
+
+
+def resolve_weights_path(weights_path: Optional[str], fold_index: int) -> Optional[str]:
+    if not weights_path:
+        return None
+    path = Path(weights_path)
+    if not path.is_dir():
+        raise ValueError(f"weights_path must be a directory, got: {weights_path}")
+
+    pt_files = list(path.glob("*.pt*"))
+    if not pt_files:
+        raise FileNotFoundError(f"No .pt files found in directory: {weights_path}")
+        
+    # If there's exactly one file, just return it
+    if len(pt_files) == 1:
+        return str(pt_files[0])
+        
+    # Determine if files are 0-indexed or 1-indexed based on the minimum number
+    file_nums = {}
+    for f in pt_files:
+        nums = re.findall(r'\d+', f.name)
+        if nums:
+            file_nums[int(nums[-1])] = f
+            
+    if not file_nums:
+        raise FileNotFoundError(f"Could not parse fold numbers from .pt files in: {weights_path}")
+        
+    min_idx = min(file_nums.keys())
+    target_idx = fold_index + 1 if min_idx == 1 else fold_index
+    
+    if target_idx in file_nums:
+        return str(file_nums[target_idx])
+        
+    raise FileNotFoundError(f"Could not find a weight file for fold {fold_index} (expected index {target_idx}) in: {weights_path}")
 
 
 def set_seed(seed: int) -> None:
@@ -182,7 +217,7 @@ def _filter_supported_config_updates(
 
 
 
-def _run_staged_training_for_fold(
+def _run_stage1_tabular(
     fold_index: int,
     config: MidFusionLiteConfig,
     train_loader: DataLoader,
@@ -191,17 +226,18 @@ def _run_staged_training_for_fold(
     pos_weight: float,
     x_train_shape: int,
     bins: Any,
-) -> tuple[dict[str, torch.Tensor], list[dict[str, float]], float]:
-    print(f"\n" + "=" * 80)
-    print(f"  >>> RUNNING 3-STAGE PROGRESSIVE TRAINING FOR FOLD {fold_index + 1} <<<")
-    print("=" * 80)
-
-    # =========================================================================
-    # STAGE 1: Tabular-Only Pretraining
-    # =========================================================================
+    cat_cardinalities: Optional[list[int]] = None,
+) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]], float]:
     best_tab_state = None
+    history = []
+    best_tab_score = 0.0
     if config.pretrained_tabular_dir is not None:
-        tab_path = Path(config.pretrained_tabular_dir) / f"mid_fusion_lite_fold_{fold_index}.pt"
+        pt_dir = config.pretrained_tabular_dir
+        if "{fold}" in pt_dir or "{fold_1}" in pt_dir:
+            tab_path = Path(pt_dir.format(fold=fold_index, fold_1=fold_index + 1))
+        else:
+            tab_path = Path(pt_dir) / f"mid_fusion_lite_fold_{fold_index}.pt"
+            
         if tab_path.exists():
             print(f"\n[Stage 1] Loading pre-trained tabular weights from checkpoint: {tab_path}")
             best_tab_state = torch.load(tab_path, map_location="cpu", weights_only=True)
@@ -226,17 +262,17 @@ def _run_staged_training_for_fold(
             tab_dropout=config.tab_dropout,
             fusion_dropout=config.fusion_dropout,
             train_image_backbone=False,
-            use_pretrained_backbone=False,
+            download_pretrained_backbone=False,
             modality_dropout_prob=0.0,
             modality_mode="tabular_only",
             bins=bins,
             d_embedding=config.d_embedding,
             init_bias=None,
+            cat_cardinalities=cat_cardinalities,
         ).to(device)
 
         _initialize_lazy_parameters(model_tab, device, config.image_size, x_train_shape)
 
-        # Optimize: Build temporary tabular-only datasets/loaders to bypass expensive image loading in Stage 1
         train_ds_tab = HDF5ImageTabularDataset(
             ids=train_loader.dataset.ids,
             tabular=train_loader.dataset.tabular,
@@ -275,12 +311,29 @@ def _run_staged_training_for_fold(
         )
 
         opt_tab = torch.optim.AdamW(model_tab.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-        best_tab_state, _, _ = fit_one_fold(
+        
+        warmup_epochs = config.warmup_epochs
+        if warmup_epochs > 0:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                opt_tab, start_factor=0.1, total_iters=warmup_epochs
+            )
+            main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt_tab, T_max=max(1, config.stage1_epochs - warmup_epochs), eta_min=config.min_lr
+            )
+            scheduler_tab = torch.optim.lr_scheduler.SequentialLR(
+                opt_tab, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs]
+            )
+        else:
+            scheduler_tab = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt_tab, T_max=max(1, config.stage1_epochs), eta_min=config.min_lr
+            )
+
+        best_tab_state, history, best_tab_score = fit_one_fold(
             model=model_tab,
             train_loader=train_loader_tab,
             valid_loader=valid_loader_tab,
             optimizer=opt_tab,
-            scheduler=None,
+            scheduler=scheduler_tab,
             device=device,
             epochs=config.stage1_epochs,
             patience=config.patience,
@@ -289,7 +342,7 @@ def _run_staged_training_for_fold(
             max_train_steps_per_epoch=config.max_train_steps_per_epoch,
             max_valid_steps=config.max_valid_steps,
             aux_loss_image_weight=0.0,
-            aux_loss_tab_weight=0.0,
+            aux_loss_tab_weight=1.0,
             gradient_clipping_norm=config.gradient_clipping_norm,
             label_smoothing=config.label_smoothing,
         )
@@ -297,9 +350,31 @@ def _run_staged_training_for_fold(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    # =========================================================================
-    # STAGE 2: Image-Only Pretraining
-    # =========================================================================
+        # Save Stage 1 checkpoint so it can be reloaded without retraining.
+        # Uses pretrained_tabular_dir if set, otherwise output_dir/stage1_tabular/.
+        if best_tab_state is not None and config.save_checkpoints:
+            save_dir = Path(
+                config.pretrained_tabular_dir
+                if config.pretrained_tabular_dir is not None
+                else Path(config.output_dir) / "stage1_tabular"
+            )
+            save_dir.mkdir(parents=True, exist_ok=True)
+            save_path = save_dir / f"mid_fusion_lite_fold_{fold_index}.pt"
+            torch.save(best_tab_state, save_path)
+            print(f"  [Stage 1] Checkpoint saved → {save_path}")
+
+    return best_tab_state, history, best_tab_score
+
+
+def _run_stage2_image(
+    fold_index: int,
+    config: MidFusionLiteConfig,
+    train_loader: DataLoader,
+    valid_loader: DataLoader,
+    device: torch.device,
+    pos_weight: float,
+    x_train_shape: int,
+) -> Optional[dict[str, torch.Tensor]]:
     best_img_state = None
     if config.pretrained_image_dir is not None:
         img_path = Path(config.pretrained_image_dir) / f"mid_fusion_lite_fold_{fold_index}.pt"
@@ -326,9 +401,9 @@ def _run_staged_training_for_fold(
             cross_attention_dropout=config.cross_attention_dropout,
             tab_dropout=config.tab_dropout,
             fusion_dropout=config.fusion_dropout,
-            train_image_backbone=True,
-            use_pretrained_backbone=config.use_pretrained_backbone,
-            backbone_weights_path=config.backbone_weights_path,
+            train_image_backbone=config.stage2_train_backbone,
+            download_pretrained_backbone=config.download_pretrained_backbone,
+            backbone_weights_path=resolve_weights_path(config.backbone_weights_path, fold_index),
             modality_dropout_prob=0.0,
             modality_mode="image_only",
             bins=None,
@@ -339,12 +414,29 @@ def _run_staged_training_for_fold(
         _initialize_lazy_parameters(model_img, device, config.image_size, x_train_shape)
 
         opt_img = torch.optim.AdamW(model_img.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+
+        warmup_epochs = max(1, config.warmup_epochs) if config.warmup_epochs > 0 else 0
+        if warmup_epochs > 0 and config.stage2_epochs > warmup_epochs:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                opt_img, start_factor=0.1, total_iters=warmup_epochs
+            )
+            main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt_img, T_max=config.stage2_epochs - warmup_epochs, eta_min=config.min_lr
+            )
+            scheduler_img = torch.optim.lr_scheduler.SequentialLR(
+                opt_img, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs]
+            )
+        else:
+            scheduler_img = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt_img, T_max=max(1, config.stage2_epochs), eta_min=config.min_lr
+            )
+
         best_img_state, _, _ = fit_one_fold(
             model=model_img,
             train_loader=train_loader,
             valid_loader=valid_loader,
             optimizer=opt_img,
-            scheduler=None,
+            scheduler=scheduler_img,
             device=device,
             epochs=config.stage2_epochs,
             patience=config.patience,
@@ -352,7 +444,7 @@ def _run_staged_training_for_fold(
             use_amp=(config.use_amp and device.type == "cuda"),
             max_train_steps_per_epoch=config.max_train_steps_per_epoch,
             max_valid_steps=config.max_valid_steps,
-            aux_loss_image_weight=0.0,
+            aux_loss_image_weight=1.0,
             aux_loss_tab_weight=0.0,
             gradient_clipping_norm=config.gradient_clipping_norm,
             label_smoothing=config.label_smoothing,
@@ -361,9 +453,36 @@ def _run_staged_training_for_fold(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    # =========================================================================
-    # STAGE 3: Fusion and Fine-Tuning
-    # =========================================================================
+        # Save Stage 2 checkpoint so it can be reloaded without retraining.
+        # This is the cleanest image-only checkpoint — before Stage 3 fusion distorts image_head.
+        # Uses pretrained_image_dir if set, otherwise output_dir/stage2_image/.
+        if best_img_state is not None and config.save_checkpoints:
+            save_dir = Path(
+                config.pretrained_image_dir
+                if config.pretrained_image_dir is not None
+                else Path(config.output_dir) / "stage2_image"
+            )
+            save_dir.mkdir(parents=True, exist_ok=True)
+            save_path = save_dir / f"mid_fusion_lite_fold_{fold_index}.pt"
+            torch.save(best_img_state, save_path)
+            print(f"  [Stage 2] Checkpoint saved → {save_path}")
+
+    return best_img_state
+
+
+def _run_stage3_fusion(
+    fold_index: int,
+    config: MidFusionLiteConfig,
+    train_loader: DataLoader,
+    valid_loader: DataLoader,
+    device: torch.device,
+    pos_weight: float,
+    x_train_shape: int,
+    bins: Any,
+    best_tab_state: Optional[dict[str, torch.Tensor]],
+    best_img_state: Optional[dict[str, torch.Tensor]],
+    cat_cardinalities: Optional[list[int]] = None,
+) -> tuple[dict[str, torch.Tensor], list[dict[str, float]], float]:
     print(f"\n[Stage 3] Fusion & Fine-Tuning...")
     init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
     model = MidFusionLiteModel(
@@ -382,39 +501,59 @@ def _run_staged_training_for_fold(
         tab_dropout=config.tab_dropout,
         fusion_dropout=config.fusion_dropout,
         train_image_backbone=config.train_image_backbone,
-        use_pretrained_backbone=config.use_pretrained_backbone,
-        backbone_weights_path=config.backbone_weights_path,
+        download_pretrained_backbone=config.download_pretrained_backbone,
+        backbone_weights_path=resolve_weights_path(config.backbone_weights_path, fold_index),
         modality_dropout_prob=config.modality_dropout_prob,
         modality_mode="both",
         bins=bins,
         d_embedding=config.d_embedding,
         init_bias=init_bias,
+        cat_cardinalities=cat_cardinalities,
     ).to(device)
 
     _initialize_lazy_parameters(model, device, config.image_size, x_train_shape)
 
-    # Load pre-trained weights
     model.load_unimodal_weights(
         tabular_state=best_tab_state,
         image_state=best_img_state,
     )
 
-    # Stage 3A: Freeze encoders, train fusion head
     print(f"\n  [Stage 3A] Freeze encoders, train fusion head (epochs={config.stage3_freeze_epochs})...")
     for p in model.tabular_encoder.parameters():
         p.requires_grad = False
     for p in model.image_encoder.parameters():
         p.requires_grad = False
 
+    _stage3a_lr = config.stage3a_lr if config.stage3a_lr is not None else config.lr
     fusion_params = [p for p in model.parameters() if p.requires_grad]
-    opt_fusion = torch.optim.AdamW(fusion_params, lr=config.lr, weight_decay=config.weight_decay)
+    opt_fusion = torch.optim.AdamW(fusion_params, lr=_stage3a_lr, weight_decay=config.weight_decay)
+    print(f"  Stage 3A lr={_stage3a_lr:.2e}")
+
+    # Warmup for Stage 3A: cross_attention/fusion head is randomly initialized →
+    # constant high LR causes unstable valid_loss oscillation in early epochs.
+    n_freeze = max(1, int(config.stage3_freeze_epochs))
+    warmup_3a = 1 if n_freeze > 1 else 0
+    if warmup_3a > 0:
+        _w3a = torch.optim.lr_scheduler.LinearLR(
+            opt_fusion, start_factor=0.1, total_iters=warmup_3a
+        )
+        _c3a = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt_fusion, T_max=max(1, n_freeze - warmup_3a), eta_min=config.min_lr
+        )
+        scheduler_3a = torch.optim.lr_scheduler.SequentialLR(
+            opt_fusion, schedulers=[_w3a, _c3a], milestones=[warmup_3a]
+        )
+    else:
+        scheduler_3a = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt_fusion, T_max=n_freeze, eta_min=config.min_lr
+        )
 
     best_fusion_state, history_a, best_score_a = fit_one_fold(
         model=model,
         train_loader=train_loader,
         valid_loader=valid_loader,
         optimizer=opt_fusion,
-        scheduler=None,
+        scheduler=scheduler_3a,
         device=device,
         epochs=config.stage3_freeze_epochs,
         patience=config.patience,
@@ -422,16 +561,16 @@ def _run_staged_training_for_fold(
         use_amp=(config.use_amp and device.type == "cuda"),
         max_train_steps_per_epoch=config.max_train_steps_per_epoch,
         max_valid_steps=config.max_valid_steps,
-        aux_loss_image_weight=config.aux_loss_image_weight,
-        aux_loss_tab_weight=config.aux_loss_tab_weight,
+        # Fix: encoders are frozen in Stage 3A → auxiliary losses cannot propagate
+        # gradient to the backbone, so setting them to 0 avoids wasted computation.
+        aux_loss_image_weight=0.0,
+        aux_loss_tab_weight=0.0,
         gradient_clipping_norm=config.gradient_clipping_norm,
         label_smoothing=config.label_smoothing,
     )
 
-    # Load best state from 3A and unfreeze for final fine-tuning
     model.load_state_dict(best_fusion_state)
 
-    # Stage 3B: Unfreeze encoders, joint fine-tuning
     print(f"\n  [Stage 3B] Unfreeze encoders, joint fine-tuning (epochs={config.stage3_unfreeze_epochs})...")
     for p in model.tabular_encoder.parameters():
         p.requires_grad = True
@@ -439,14 +578,51 @@ def _run_staged_training_for_fold(
         for p in model.image_encoder.parameters():
             p.requires_grad = True
 
-    all_trainable = [p for p in model.parameters() if p.requires_grad]
-    opt_finetune = torch.optim.AdamW(all_trainable, lr=0.1 * config.lr, weight_decay=config.weight_decay)
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt_finetune,
-        T_max=max(1, int(config.stage3_unfreeze_epochs)),
-        eta_min=config.min_lr,
+    _stage3b_lr = config.stage3b_lr if config.stage3b_lr is not None else 0.1 * config.lr
+    # Differential lr: the image backbone fine-tunes gently at _stage3b_lr, while the
+    # tabular encoder + fusion head (only briefly trained in Stage 3A) get a higher lr so
+    # they keep adapting instead of freezing at the backbone's tiny lr. Split params by
+    # identity to avoid double-counting shared tensors.
+    _head_lr_mult = float(getattr(config, "stage3b_head_lr_mult", 5.0))
+    backbone_param_ids = (
+        {id(p) for p in model.image_encoder.parameters()}
+        if model.image_encoder is not None
+        else set()
     )
+    backbone_params = [
+        p for p in model.parameters() if p.requires_grad and id(p) in backbone_param_ids
+    ]
+    head_params = [
+        p for p in model.parameters() if p.requires_grad and id(p) not in backbone_param_ids
+    ]
+    _head_lr = _stage3b_lr * _head_lr_mult
+    param_groups = []
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": _stage3b_lr})
+    if head_params:
+        param_groups.append({"params": head_params, "lr": _head_lr})
+    opt_finetune = torch.optim.AdamW(param_groups, lr=_stage3b_lr, weight_decay=config.weight_decay)
+    print(f"  Stage 3B lr: backbone={_stage3b_lr:.2e} | head/tabular={_head_lr:.2e}")
+
+    # Fix: add 1-epoch LinearLR warmup before cosine decay.
+    # Unfreezing encoders mid-training causes sudden large gradient spikes;
+    # warmup lets the optimizer settle before the full lr is applied.
+    n_unfreeze = max(1, int(config.stage3_unfreeze_epochs))
+    warmup_unfreeze = 1 if n_unfreeze > 1 else 0
+    if warmup_unfreeze > 0:
+        _warmup = torch.optim.lr_scheduler.LinearLR(
+            opt_finetune, start_factor=0.1, total_iters=warmup_unfreeze
+        )
+        _cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt_finetune, T_max=max(1, n_unfreeze - warmup_unfreeze), eta_min=config.min_lr
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            opt_finetune, schedulers=[_warmup, _cosine], milestones=[warmup_unfreeze]
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt_finetune, T_max=n_unfreeze, eta_min=config.min_lr
+        )
 
     best_final_state, history_b, best_score_b = fit_one_fold(
         model=model,
@@ -468,18 +644,59 @@ def _run_staged_training_for_fold(
     )
 
     combined_history = history_a + history_b
-    return best_final_state, combined_history, float(max(best_score_a, best_score_b))
+    # Fix: return the checkpoint that actually achieved the best score.
+    # If Stage 3A outperformed Stage 3B, best_final_state (3B) would be returned
+    # with a misleadingly high score from 3A — now we return the correct pair.
+    if best_score_b >= best_score_a:
+        return best_final_state, combined_history, float(best_score_b)
+    else:
+        print(
+            f"  Stage 3A pAUC ({best_score_a:.5f}) > Stage 3B ({best_score_b:.5f})."
+            " Returning Stage 3A best checkpoint."
+        )
+        return best_fusion_state, combined_history, float(best_score_a)
+
+
+def _run_staged_pretraining_for_fold(
+    fold_index: int,
+    config: MidFusionLiteConfig,
+    train_loader: DataLoader,
+    valid_loader: DataLoader,
+    device: torch.device,
+    pos_weight: float,
+    x_train_shape: int,
+    bins: Any,
+    cat_cardinalities: Optional[list[int]] = None,
+) -> tuple[dict[str, torch.Tensor], list[dict[str, float]], float]:
+    print(f"\n" + "=" * 80)
+    print(f"  >>> RUNNING 3-STAGE PROGRESSIVE TRAINING FOR FOLD {fold_index + 1} <<<")
+    print("=" * 80)
+
+    best_tab_state, _, _ = _run_stage1_tabular(
+        fold_index, config, train_loader, valid_loader, device, pos_weight, x_train_shape, bins,
+        cat_cardinalities=cat_cardinalities,
+    )
+
+    best_img_state = _run_stage2_image(
+        fold_index, config, train_loader, valid_loader, device, pos_weight, x_train_shape
+    )
+
+    return _run_stage3_fusion(
+        fold_index, config, train_loader, valid_loader, device, pos_weight, x_train_shape, bins, best_tab_state, best_img_state,
+        cat_cardinalities=cat_cardinalities,
+    )
 
 
 def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Callable[[int, float], None]] = None) -> dict[str, Any]:
     config = resolve_data_paths(config)
 
-    if config.backbone_weights_path and not Path(config.backbone_weights_path).exists():
-        print(
-            "Backbone weights path does not exist on this machine. "
-            "Ignoring backbone_weights_path and using default backbone init."
-        )
-        config = config.with_updates(backbone_weights_path=None)
+    if config.backbone_weights_path:
+        if "{fold}" not in config.backbone_weights_path and not Path(config.backbone_weights_path).exists():
+            print(
+                "Backbone weights path does not exist on this machine. "
+                "Ignoring backbone_weights_path and using default backbone init."
+            )
+            config = config.with_updates(backbone_weights_path=None)
 
     set_seed(config.seed)
     device = _get_device()
@@ -521,46 +738,37 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
 
     _validate_columns(config, train_df, test_df)
 
-    if bool(config.use_feature_engineering):
-        try:
-            train_df, test_df = add_feature_engineering(
-                train_df=train_df,
-                test_df=test_df,
-                group_col=config.group_col,
-                categorical_cols=config.categorical_cols,
-                use_contextual_group_norm_features=bool(config.use_contextual_group_norm_features),
-                use_ugly_duckling_features=bool(config.use_ugly_duckling_features),
-                use_anatomical_zscore_features=bool(config.use_anatomical_zscore_features),
-                use_area_aggregation_features=bool(config.use_area_aggregation_features),
-            )
-        except MemoryError:
-            print(
-                "MemoryError during feature engineering. "
-                "Retrying without heavy engineered features."
-            )
-            gc.collect()
-    else:
+    # NOTE: Feature engineering is intentionally NOT applied here on the whole train_df.
+    # Some engineered features are global statistics (anatomical z-scores, median
+    # imputation, LOF standardization) that would leak validation info if fit over
+    # train+valid together. Instead, add_feature_engineering_folds is called INSIDE the
+    # fold loop below, fitting stats on fold-train only. Column selection likewise moves
+    # into the loop (the engineered column set is deterministic across folds).
+    if not bool(config.use_feature_engineering):
         print("Skipping heavy feature engineering (use_feature_engineering=False).")
-
-    numeric_cols, categorical_cols = select_available_columns(
-        train_df=train_df,
-        test_df=test_df,
-        numeric_candidates=config.numeric_cols,
-        categorical_candidates=config.categorical_cols,
-    )
-
-    print(f"Numeric features: {len(numeric_cols)}")
-    print(f"Categorical features: {len(categorical_cols)}")
 
     y = train_df[config.target_col].astype(np.int64).to_numpy()
     groups = train_df[config.group_col].to_numpy()
 
-    splitter = StratifiedGroupKFold(
-        n_splits=config.n_splits,
-        shuffle=True,
-        random_state=config.seed,
-    )
-    folds = list(splitter.split(train_df, y, groups))
+    if config.fold_col is not None and config.fold_col in train_df.columns:
+        print(f"Found fold column '{config.fold_col}' in train metadata. Using pre-defined fold splits.")
+        # Identify unique folds in sorted order (excluding NaNs and negative indices)
+        unique_folds = sorted([f for f in train_df[config.fold_col].unique() if pd.notna(f) and f >= 0])
+        folds = []
+        for f in unique_folds:
+            valid_idx = np.where(train_df[config.fold_col] == f)[0]
+            train_idx = np.where((train_df[config.fold_col] != f) & (train_df[config.fold_col] >= 0))[0]
+            folds.append((train_idx, valid_idx))
+        if len(folds) != config.n_splits:
+            print(f"[Warning] Number of unique folds in '{config.fold_col}' ({len(folds)}) does not match config.n_splits ({config.n_splits}). Using folds from column.")
+    else:
+        print(f"Fold column '{config.fold_col}' not found. Generating fold splits dynamically using StratifiedGroupKFold.")
+        splitter = StratifiedGroupKFold(
+            n_splits=config.n_splits,
+            shuffle=True,
+            random_state=config.seed,
+        )
+        folds = list(splitter.split(train_df, y, groups))
 
     if config.fold_indices is None:
         selected_folds = list(range(config.n_splits))
@@ -589,6 +797,48 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
         fold_train_df = train_df.iloc[train_idx].reset_index(drop=True)
         fold_valid_df = train_df.iloc[valid_idx].reset_index(drop=True)
 
+        # Leak-safe feature engineering: fit engineering statistics on THIS fold's train
+        # split only, then transform fold-valid and test with those frozen stats. test_df
+        # is left untouched (the helper copies internally) so each fold re-derives its own
+        # fold_test_df — required because the fold-train statistics differ per fold.
+        fold_test_df = test_df
+        if bool(config.use_feature_engineering):
+            try:
+                fold_train_df, fold_valid_df, fold_test_df = add_feature_engineering_folds(
+                    fold_train_df=fold_train_df,
+                    fold_valid_df=fold_valid_df,
+                    test_df=test_df,
+                    group_col=config.group_col,
+                    categorical_cols=config.categorical_cols,
+                    use_contextual_group_norm_features=bool(config.use_contextual_group_norm_features),
+                    use_ugly_duckling_features=bool(config.use_ugly_duckling_features),
+                    use_anatomical_zscore_features=bool(config.use_anatomical_zscore_features),
+                    use_area_aggregation_features=bool(config.use_area_aggregation_features),
+                )
+            except MemoryError:
+                print(
+                    "MemoryError during feature engineering. "
+                    "Falling back to raw features for this fold."
+                )
+                gc.collect()
+                fold_test_df = test_df
+
+        # Column selection is deterministic across folds (engineered names are fixed), but
+        # must run on engineered frames, so it lives here rather than before the loop.
+        numeric_cols, categorical_cols = select_available_columns(
+            train_df=fold_train_df,
+            test_df=fold_test_df,
+            numeric_candidates=config.numeric_cols,
+            categorical_candidates=config.categorical_cols,
+        )
+        print(f"Numeric features: {len(numeric_cols)} | Categorical features: {len(categorical_cols)}")
+
+        y_train = fold_train_df[config.target_col].astype(np.float32).to_numpy()
+        y_valid = fold_valid_df[config.target_col].astype(np.float32).to_numpy()
+
+        # We pass the full dataset to the preprocessor and dataloader.
+        # Undersampling is dynamically handled by make_balanced_sampler per epoch.
+        fold_train_df_sampled = fold_train_df
         preprocessor = FoldTabularPreprocessor(
             numeric_cols=numeric_cols,
             categorical_cols=categorical_cols,
@@ -602,21 +852,22 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             null_importance_quantile=float(config.null_importance_quantile),
             null_importance_min_kept=int(config.null_importance_min_kept),
             target_col=config.target_col,
+            categorical_as_codes=bool(config.use_tabm_tabular),
         )
-        preprocessor.fit(fold_train_df)
+        preprocessor.fit(fold_train_df_sampled)
 
-        x_train = preprocessor.transform(fold_train_df)
+        x_train_sampled = preprocessor.transform(fold_train_df_sampled)
         x_valid = preprocessor.transform(fold_valid_df)
-        x_test = preprocessor.transform(test_df)
+        x_test = preprocessor.transform(fold_test_df)
 
-        y_train = fold_train_df[config.target_col].astype(np.float32).to_numpy()
-        y_valid = fold_valid_df[config.target_col].astype(np.float32).to_numpy()
+        y_train_sampled = fold_train_df_sampled[config.target_col].astype(np.float32).to_numpy()
+        ids_train_sampled = fold_train_df_sampled[config.id_col].astype(str).to_numpy()
 
         train_dataset = HDF5ImageTabularDataset(
-            ids=fold_train_df[config.id_col].astype(str).to_numpy(),
-            tabular=x_train,
+            ids=ids_train_sampled,
+            tabular=x_train_sampled,
             hdf5_path=config.train_hdf5_path,
-            targets=y_train,
+            targets=y_train_sampled,
             transforms=transforms["train"],
             use_shades_of_gray=bool(config.use_shades_of_gray),
             modality_mode=config.modality_mode,
@@ -633,7 +884,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             image_size=config.image_size,
         )
         test_dataset = HDF5ImageTabularDataset(
-            ids=test_df[config.id_col].astype(str).to_numpy(),
+            ids=fold_test_df[config.id_col].astype(str).to_numpy(),
             tabular=x_test,
             hdf5_path=config.test_hdf5_path,
             targets=None,
@@ -643,27 +894,27 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             image_size=config.image_size,
         )
 
-        if "tbp_lv_nevi_confidence" in fold_train_df.columns:
-            # Nevus confidence: 0 (least likely nevus) to 100 (most likely nevus).
-            # Hard negatives are those with low nevus confidence (meaning they look like melanoma).
-            nevi_conf = fold_train_df["tbp_lv_nevi_confidence"].fillna(50.0).to_numpy()
-            # Add a base weight of 0.1 so easy negatives still have a chance of being sampled
-            hard_negative_weights = 0.1 + 0.9 * (((100.0 - nevi_conf) / 100.0) ** 2.0)
+        if getattr(config, "tabular_full_data", False) and getattr(config, "stage_to_run", "all") == "stage1":
+            # For tree models or pure tabular pretraining on full data, no undersampling
+            train_sampler = None
+            train_shuffle = True
+        elif config.negative_ratio > 0:
+            # Dynamic undersampling per epoch
+            train_sampler = make_balanced_sampler(
+                targets=y_train_sampled,
+                negative_ratio=config.negative_ratio,
+                seed=config.seed + fold_index
+            )
+            train_shuffle = False
         else:
-            hard_negative_weights = None
-
-        sampler = make_balanced_sampler(
-            targets=y_train,
-            negative_ratio=config.negative_ratio,
-            seed=config.seed + fold_index,
-            hard_negative_weights=hard_negative_weights,
-        )
+            train_sampler = None
+            train_shuffle = True
 
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.train_batch_size,
-            sampler=sampler,
-            shuffle=sampler is None,
+            sampler=train_sampler,
+            shuffle=train_shuffle,
             num_workers=config.num_workers,
             pin_memory=(device.type == "cuda"),
             drop_last=False,
@@ -685,10 +936,17 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             drop_last=False,
         )
 
+        # Categorical features are fed to TabM as integer codes (one column each, appended
+        # after the numeric block) via cat_cardinalities; PLE bins cover numeric features only.
+        cat_cardinalities = (
+            list(preprocessor.cat_cardinalities) if config.use_tabm_tabular else None
+        )
+        n_numeric = int(preprocessor.n_numeric_out)
+
         bins = None
-        if config.use_tabm_tabular:
+        if config.use_tabm_tabular and n_numeric > 0:
             import rtdl_num_embeddings
-            x_train_tensor = torch.tensor(x_train, dtype=torch.float32)
+            x_train_tensor = torch.tensor(x_train_sampled[:, :n_numeric], dtype=torch.float32)
             raw_bins = rtdl_num_embeddings.compute_bins(
                 x_train_tensor,
                 n_bins=config.n_bins
@@ -705,29 +963,78 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
                 bins.append(b_wide)
 
         if config.pos_weight is not None:
-            pos_weight = float(config.pos_weight)
+            pos_weight_full    = float(config.pos_weight)
+            pos_weight_sampled = float(config.pos_weight)
         else:
             n_pos = max(float(y_train.sum()), 1.0)
             n_neg = max(float(len(y_train) - y_train.sum()), 1.0)
-            pos_weight = np.sqrt(n_neg / n_pos)
+            # pos_weight_full: used when NO sampler is active (tabular full-data Stage 1).
+            # Reflects the true class imbalance in the data.
+            pos_weight_full = np.sqrt(n_neg / n_pos)
+            # pos_weight_sampled: used when undersampling is active (negative_ratio batches).
+            # The manual undersampling already corrects for imbalance, so pos_weight should only reflect
+            # the residual ratio seen in each batch, not the raw data ratio.
+            pos_weight_sampled = np.sqrt(max(float(config.negative_ratio), 1.0))
 
-        if bool(config.staged_training):
-            best_state, history, best_valid_score = _run_staged_training_for_fold(
-                fold_index=fold_index,
-                config=config,
-                train_loader=train_loader,
-                valid_loader=valid_loader,
-                device=device,
-                pos_weight=pos_weight,
-                x_train_shape=x_train.shape[1],
-                bins=bins,
-            )
+        # Each stage is normally launched as its OWN run with its own config.negative_ratio
+        # (e.g. Stage 1 at 1:100, Stage 2 at 1:1, Stage 3 at 1:2), so the log should only
+        # describe the stage that actually trains in THIS run — not lump Stage 2/3 together.
+        neg_ratio = int(max(float(config.negative_ratio), 1.0))
+        stage_to_run = getattr(config, "stage_to_run", "all")
+        if not bool(config.use_staged_pretraining):
+            run_label = "end-to-end (both)"
+        elif stage_to_run == "stage1":
+            run_label = "Stage 1 (tabular)"
+        elif stage_to_run == "stage2":
+            run_label = "Stage 2 (image)"
+        elif stage_to_run == "stage3":
+            run_label = "Stage 3 (fusion)"
+        else:
+            run_label = "Stage 1->3 (staged)"
+
+        # No sampler only in the tabular full-data pretraining special case; otherwise the
+        # balanced sampler (negative_ratio:1) is active and pos_weight_sampled applies.
+        stage1_no_sampler = (
+            bool(getattr(config, "tabular_full_data", False)) and stage_to_run == "stage1"
+        )
+        if stage1_no_sampler:
+            print(f"  [{run_label}] no sampler (tabular full-data) -> pos_weight_full={pos_weight_full:.3f}")
+        else:
+            print(f"  [{run_label}] sampler 1:{neg_ratio} -> pos_weight_sampled={pos_weight_sampled:.3f}")
+
+        if bool(config.use_staged_pretraining):
+            if getattr(config, "stage_to_run", "all") == "stage1":
+                print(f"\n  >>> RUNNING STAGE 1 (TABULAR ONLY) FOR FOLD {fold_index + 1} <<<")
+                # Stage 1 with tabular_full_data uses no sampler → use full-data pos_weight
+                stage1_pos_weight = pos_weight_full if getattr(config, "tabular_full_data", False) else pos_weight_sampled
+                best_state, history, best_valid_score = _run_stage1_tabular(
+                    fold_index, config, train_loader, valid_loader, device, stage1_pos_weight, x_train_sampled.shape[1], bins,
+                    cat_cardinalities=cat_cardinalities,
+                )
+            else:
+                best_state, history, best_valid_score = _run_staged_pretraining_for_fold(
+                    fold_index=fold_index,
+                    config=config,
+                    train_loader=train_loader,
+                    valid_loader=valid_loader,
+                    device=device,
+                    # Stage 2 & 3 run with the balanced undersampler active (negative_ratio),
+                    # which already corrects most of the class imbalance per batch. Stacking
+                    # pos_weight_full (≈sqrt of the raw ratio) on top double-counts the
+                    # correction: positives dominate the gradient, train_loss explodes, and
+                    # valid_loss drifts upward while pAUC plateaus. Use pos_weight_sampled so
+                    # the loss only reflects the residual imbalance the sampler leaves behind.
+                    pos_weight=pos_weight_sampled,
+                    x_train_shape=x_train_sampled.shape[1],
+                    bins=bins,
+                    cat_cardinalities=cat_cardinalities,
+                )
             
             # Recreate model so we can load the best stage weights and run inference
             init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
             model = MidFusionLiteModel(
                 backbone_name=config.backbone_name,
-                n_tab_features=x_train.shape[1],
+                n_tab_features=x_train_sampled.shape[1],
                 use_tabm_tabular=config.use_tabm_tabular,
                 tab_hidden_dim=config.tab_hidden_dim,
                 tabm_arch_type=config.tabm_arch_type,
@@ -741,48 +1048,50 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
                 tab_dropout=config.tab_dropout,
                 fusion_dropout=config.fusion_dropout,
                 train_image_backbone=config.train_image_backbone,
-                use_pretrained_backbone=config.use_pretrained_backbone,
-                backbone_weights_path=config.backbone_weights_path,
-                modality_dropout_prob=config.modality_dropout_prob,
-                modality_mode="both",
-                bins=bins,
-                d_embedding=config.d_embedding,
-                init_bias=init_bias,
-            ).to(device)
-            _initialize_lazy_parameters(model, device, config.image_size, x_train.shape[1])
-            model.load_state_dict(best_state)
-        else:
-            init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
-            model = MidFusionLiteModel(
-                backbone_name=config.backbone_name,
-                n_tab_features=x_train.shape[1],
-                use_tabm_tabular=config.use_tabm_tabular,
-                tab_hidden_dim=config.tab_hidden_dim,
-                tabm_arch_type=config.tabm_arch_type,
-                tabm_k=config.tabm_k,
-                tabm_n_blocks=config.tabm_n_blocks,
-                tabm_d_block=config.tabm_d_block,
-                fusion_hidden_dim=config.fusion_hidden_dim,
-                fusion_mode=config.fusion_mode,
-                cross_attention_heads=config.cross_attention_heads,
-                cross_attention_dropout=config.cross_attention_dropout,
-                tab_dropout=config.tab_dropout,
-                fusion_dropout=config.fusion_dropout,
-                train_image_backbone=config.train_image_backbone,
-                use_pretrained_backbone=config.use_pretrained_backbone,
-                backbone_weights_path=config.backbone_weights_path,
+                download_pretrained_backbone=config.download_pretrained_backbone,
+                backbone_weights_path=resolve_weights_path(config.backbone_weights_path, fold_index),
                 modality_dropout_prob=config.modality_dropout_prob,
                 modality_mode=config.modality_mode,
                 bins=bins,
                 d_embedding=config.d_embedding,
                 init_bias=init_bias,
+                cat_cardinalities=cat_cardinalities,
+            ).to(device)
+            _initialize_lazy_parameters(model, device, config.image_size, x_train_sampled.shape[1])
+            model.load_state_dict(best_state)
+        else:
+            init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
+            model = MidFusionLiteModel(
+                backbone_name=config.backbone_name,
+                n_tab_features=x_train_sampled.shape[1],
+                use_tabm_tabular=config.use_tabm_tabular,
+                tab_hidden_dim=config.tab_hidden_dim,
+                tabm_arch_type=config.tabm_arch_type,
+                tabm_k=config.tabm_k,
+                tabm_n_blocks=config.tabm_n_blocks,
+                tabm_d_block=config.tabm_d_block,
+                fusion_hidden_dim=config.fusion_hidden_dim,
+                fusion_mode=config.fusion_mode,
+                cross_attention_heads=config.cross_attention_heads,
+                cross_attention_dropout=config.cross_attention_dropout,
+                tab_dropout=config.tab_dropout,
+                fusion_dropout=config.fusion_dropout,
+                train_image_backbone=config.train_image_backbone,
+                download_pretrained_backbone=config.download_pretrained_backbone,
+                backbone_weights_path=resolve_weights_path(config.backbone_weights_path, fold_index),
+                modality_dropout_prob=config.modality_dropout_prob,
+                modality_mode=config.modality_mode,
+                bins=bins,
+                d_embedding=config.d_embedding,
+                init_bias=init_bias,
+                cat_cardinalities=cat_cardinalities,
             )
             model = model.to(device)
             _initialize_lazy_parameters(
                 model=model,
                 device=device,
                 image_size=config.image_size,
-                n_tab_features=x_train.shape[1],
+                n_tab_features=x_train_sampled.shape[1],
             )
 
             trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -827,7 +1136,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
                 device=device,
                 epochs=config.epochs,
                 patience=config.patience,
-                pos_weight=pos_weight,
+                pos_weight=pos_weight_sampled,  # Sampler active → use sampled pos_weight
                 use_amp=(config.use_amp and device.type == "cuda"),
                 max_train_steps_per_epoch=config.max_train_steps_per_epoch,
                 max_valid_steps=config.max_valid_steps,
@@ -929,7 +1238,19 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
     metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
 
     print("=" * 80)
-    print(f"CV pAUC: {cv_pauc:.6f}")
+    print("TRAINING SUMMARY")
+    print("=" * 80)
+    
+    if fold_metrics:
+        fold_paucs = [f["best_valid_pauc"] for f in fold_metrics]
+        for f in fold_metrics:
+            print(f"Fold {f['fold']}: pAUC = {f['best_valid_pauc']:.6f} (Epochs ran: {f['epochs_ran']})")
+        avg_pauc = sum(fold_paucs) / len(fold_paucs)
+        print("-" * 80)
+        print(f"Average Fold pAUC : {avg_pauc:.6f}")
+        
+    print(f"Overall OOF pAUC  : {cv_pauc:.6f}")
+    print("=" * 80)
     print(f"Saved OOF: {oof_path}")
     print(f"Saved submission: {submission_path}")
     print(f"Saved metrics: {metrics_path}")
@@ -996,7 +1317,7 @@ def main() -> None:
     if args.image_size is not None:
         updates["image_size"] = args.image_size
     if args.staged_training:
-        updates["staged_training"] = True
+        updates["use_staged_pretraining"] = True
     if args.stage1_epochs is not None:
         updates["stage1_epochs"] = args.stage1_epochs
     if args.stage2_epochs is not None:

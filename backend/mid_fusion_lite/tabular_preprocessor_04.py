@@ -7,7 +7,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import OneHotEncoder, QuantileTransformer, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, QuantileTransformer
 
 try:
     from .tabular_selection_03 import _select_numeric_by_null_importance
@@ -88,49 +88,61 @@ class FoldTabularPreprocessor:
     null_importance_quantile: float = 0.95
     null_importance_min_kept: int = 64
     target_col: str = "target"
+    categorical_as_codes: bool = False
 
     def __post_init__(self) -> None:
         """Initialize scalers, encoders, and preprocessing state."""
         self.numeric_cols = list(dict.fromkeys(self.numeric_cols))
         self.active_numeric_cols = list(self.numeric_cols)
         self.numeric_medians: dict[str, float] = {}
-        self.scaler = StandardScaler()
         self.encoder = _build_one_hot_encoder()
         self.quantile_transformer: QuantileTransformer | None = None
+        # Label-encoding state (only used when categorical_as_codes=True). Code 0 is
+        # reserved for unknown/unseen categories; known categories take codes 1..n.
+        self.category_maps: dict[str, dict[str, int]] = {}
+        self.cat_cardinalities: list[int] = []
+        self.n_numeric_out: int = 0
         self.is_fitted = False
 
-    def _transform_base(self, df: pd.DataFrame) -> np.ndarray:
-        """Transform numeric and categorical columns into concatenated feature matrix.
+    def _transform_numeric(self, df: pd.DataFrame) -> np.ndarray | None:
+        """Scale numeric columns. Returns None when there are no numeric columns."""
+        if not self.active_numeric_cols:
+            return None
+        numeric_frame = df[self.active_numeric_cols].copy()
+        numeric_frame = numeric_frame.apply(pd.to_numeric, errors="coerce")
+        numeric_filled = numeric_frame.fillna(self.numeric_medians)
+        return numeric_filled.values.astype(np.float32)
 
-        Args:
-            df: Input DataFrame.
+    def _transform_categorical(self, df: pd.DataFrame) -> np.ndarray | None:
+        """Encode categorical columns. Returns None when there are none.
 
-        Returns:
-            Feature matrix of shape (n_samples, n_scaled + n_encoded_features).
+        One-hot by default; integer codes when ``categorical_as_codes`` is set
+        (one column per categorical feature, unknown/unseen -> 0).
+        """
+        if not self.categorical_cols:
+            return None
+        cat_frame = df[self.categorical_cols].copy()
+        cat_frame = cat_frame.astype("object").fillna("UNK").astype(str)
+        if self.categorical_as_codes:
+            codes = np.zeros((len(cat_frame), len(self.categorical_cols)), dtype=np.float32)
+            for j, col in enumerate(self.categorical_cols):
+                mapping = self.category_maps[col]
+                codes[:, j] = cat_frame[col].map(mapping).fillna(0).to_numpy(dtype=np.float32)
+            return codes
+        return self.encoder.transform(cat_frame).astype(np.float32)
+
+    @staticmethod
+    def _assemble(
+        numeric_part: np.ndarray | None, cat_part: np.ndarray | None
+    ) -> np.ndarray:
+        """Concatenate numeric and categorical chunks into one feature matrix.
 
         Raises:
-            ValueError: If no columns are available for preprocessing.
+            ValueError: If both chunks are empty.
         """
-        chunks: list[np.ndarray] = []
-
-        if self.active_numeric_cols:
-            numeric_frame = df[self.active_numeric_cols].copy()
-            numeric_frame = numeric_frame.apply(pd.to_numeric, errors="coerce")
-            numeric_filled = numeric_frame.fillna(self.numeric_medians)
-            numeric_scaled = self.scaler.transform(numeric_filled.values).astype(
-                np.float32
-            )
-            chunks.append(numeric_scaled)
-
-        if self.categorical_cols:
-            cat_frame = df[self.categorical_cols].copy()
-            cat_frame = cat_frame.astype("object").fillna("UNK").astype(str)
-            cat_encoded = self.encoder.transform(cat_frame).astype(np.float32)
-            chunks.append(cat_encoded)
-
+        chunks = [c for c in (numeric_part, cat_part) if c is not None]
         if not chunks:
             raise ValueError("No tabular columns are available after preprocessing.")
-
         if len(chunks) == 1:
             return chunks[0]
         return np.concatenate(chunks, axis=1)
@@ -170,37 +182,51 @@ class FoldTabularPreprocessor:
                 for col in self.active_numeric_cols
             }
             numeric_filled = numeric_frame.fillna(self.numeric_medians)
-            self.scaler.fit(numeric_filled.values)
+
+        # Number of numeric columns after optional null-importance filtering. Used by
+        # callers to compute PLE bins on the numeric block only (codes come after).
+        self.n_numeric_out = len(self.active_numeric_cols)
 
         if self.categorical_cols:
             cat_frame = df[self.categorical_cols].copy()
             cat_frame = cat_frame.astype("object").fillna("UNK").astype(str)
-            self.encoder.fit(cat_frame)
+            if self.categorical_as_codes:
+                # Label-encode: code 0 reserved for unknown/unseen; known categories 1..n.
+                self.category_maps = {}
+                self.cat_cardinalities = []
+                for col in self.categorical_cols:
+                    cats = sorted(cat_frame[col].unique().tolist())
+                    self.category_maps[col] = {c: i + 1 for i, c in enumerate(cats)}
+                    self.cat_cardinalities.append(len(cats) + 1)
+            else:
+                self.encoder.fit(cat_frame)
 
         if self.use_quantile_transform:
-            base_matrix = self._transform_base(df)
+            # Official TabM recipe applies QuantileTransformer to the NUMERIC block
+            # only (x_num), never to one-hot encoded categoricals — mirror that here.
+            numeric_part = self._transform_numeric(df)
 
-            if len(base_matrix) >= 2:
-                n_quantiles = max(min(len(base_matrix) // 30, 10000), 10)
-                n_quantiles = min(n_quantiles, len(base_matrix))
+            if numeric_part is not None and len(numeric_part) >= 2:
+                # Cap at 1000 quantiles to match the official TabM example; beyond
+                # ~1000 landmarks the empirical CDF gains negligible resolution.
+                n_quantiles = max(min(len(numeric_part) // 30, 1000), 10)
+                n_quantiles = min(n_quantiles, len(numeric_part))
 
-                noise = (
-                    np.random.default_rng(self.quantile_random_state)
-                    .normal(
-                        loc=0.0,
-                        scale=self.quantile_noise_std,
-                        size=base_matrix.shape,
-                    )
-                    .astype(np.float32)
-                )
-
+                rng = np.random.default_rng(self.quantile_random_state)
+                # Generate noise directly in float32 and add in-place to avoid huge memory spikes
+                noise = rng.standard_normal(size=numeric_part.shape, dtype=np.float32)
+                noise *= np.float32(self.quantile_noise_std)
+                numeric_part += noise
+                
                 self.quantile_transformer = QuantileTransformer(
                     n_quantiles=n_quantiles,
                     output_distribution="normal",
                     subsample=10**9,
                     random_state=self.quantile_random_state,
                 )
-                self.quantile_transformer.fit(base_matrix + noise)
+                self.quantile_transformer.fit(numeric_part)
+                del noise
+                del numeric_part
             else:
                 self.quantile_transformer = None
 
@@ -223,7 +249,14 @@ class FoldTabularPreprocessor:
                 "FoldTabularPreprocessor must be fitted before transform."
             )
 
-        base_matrix = self._transform_base(df)
-        if self.use_quantile_transform and self.quantile_transformer is not None:
-            return self.quantile_transformer.transform(base_matrix).astype(np.float32)
-        return base_matrix
+        numeric_part = self._transform_numeric(df)
+        if (
+            numeric_part is not None
+            and self.use_quantile_transform
+            and self.quantile_transformer is not None
+        ):
+            numeric_part = self.quantile_transformer.transform(numeric_part).astype(
+                np.float32
+            )
+        cat_part = self._transform_categorical(df)
+        return self._assemble(numeric_part, cat_part)
