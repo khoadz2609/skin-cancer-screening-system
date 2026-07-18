@@ -24,7 +24,9 @@ try:
         BASE_NUMERIC_COLS,
         MidFusionLiteConfig,
         get_preset_config,
+        modality_mode_for_run_mode,
         resolve_data_paths,
+        resolve_run_mode,
     )
     from .data import (
         HDF5ImageTabularDataset,
@@ -40,7 +42,9 @@ except ImportError:
         BASE_NUMERIC_COLS,
         MidFusionLiteConfig,
         get_preset_config,
+        modality_mode_for_run_mode,
         resolve_data_paths,
+        resolve_run_mode,
     )
     from data import (
         HDF5ImageTabularDataset,
@@ -214,6 +218,140 @@ def _filter_supported_config_updates(
     return filtered
 
 
+def _pretrained_checkpoint_names(branch: str, fold_index: int) -> list[str]:
+    """Return supported checkpoint names in preferred order for one fold."""
+    if branch == "tabular":
+        return [
+            f"mid_fusion_lite_fold_{fold_index}.pt",
+            f"tabm_fold_{fold_index}.pt",
+            f"tabm_fold_{fold_index + 1}.pt",
+            f"tabular_fold_{fold_index}.pt",
+        ]
+    if branch == "image":
+        return [
+            f"mid_fusion_lite_fold_{fold_index}.pt",
+            f"image_only_fold_{fold_index}.pt",
+            f"image_fold_{fold_index}.pt",
+            f"image_fold_{fold_index + 1}.pt",
+        ]
+    raise ValueError(f"Unsupported checkpoint branch: {branch}")
+
+
+def _resolve_pretrained_checkpoint(
+    source: str,
+    fold_index: int,
+    branch: str,
+) -> Optional[Path]:
+    """Resolve a checkpoint template, file, or directory (including subfolders)."""
+    if "{fold}" in source or "{fold_1}" in source:
+        candidate = Path(source.format(fold=fold_index, fold_1=fold_index + 1))
+        return candidate if candidate.is_file() else None
+
+    source_path = Path(source)
+    if source_path.is_file():
+        return source_path
+    if not source_path.is_dir():
+        return None
+
+    names = _pretrained_checkpoint_names(branch, fold_index)
+    for name in names:
+        direct_candidate = source_path / name
+        if direct_candidate.is_file():
+            return direct_candidate
+
+    # Kaggle datasets often wrap uploaded files in one or more extra folders.
+    for name in names:
+        matches = sorted(path for path in source_path.rglob(name) if path.is_file())
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            formatted = "\n  - ".join(str(path) for path in matches)
+            raise RuntimeError(
+                f"Multiple {branch} checkpoints match fold {fold_index} under "
+                f"{source_path}:\n  - {formatted}\n"
+                "Use a path template with {fold} or {fold_1} to disambiguate."
+            )
+    return None
+
+
+def _missing_stage3_checkpoint_error(
+    source: str,
+    fold_index: int,
+    branch: str,
+) -> FileNotFoundError:
+    expected = ", ".join(_pretrained_checkpoint_names(branch, fold_index))
+    config_key = (
+        "pretrained_tabular_dir" if branch == "tabular" else "pretrained_image_dir"
+    )
+    return FileNotFoundError(
+        f"Stage 3 requires a pre-trained {branch} checkpoint for fold "
+        f"{fold_index}, but none was found under: {source}\n"
+        f"Expected one of: {expected}\n"
+        f"Set {config_key} to the correct directory, checkpoint file, or a "
+        "template containing {fold}/{fold_1}. Stage 3 will not train the "
+        "missing unimodal branch from scratch."
+    )
+
+
+def _model_kwargs_for_mode(
+    config: MidFusionLiteConfig,
+    modality_mode: str,
+    n_tab_features: int,
+    bins: Any,
+    init_bias: Optional[float],
+    cat_cardinalities: Optional[list[int]],
+    fold_index: int,
+) -> dict[str, Any]:
+    """Build only the constructor arguments used by the requested mode."""
+    mode = str(modality_mode).strip().lower()
+    kwargs: dict[str, Any] = {
+        "modality_mode": mode,
+        "init_bias": init_bias,
+    }
+
+    if mode in {"both", "image_only"}:
+        kwargs.update(
+            backbone_name=config.backbone_name,
+            fusion_hidden_dim=config.fusion_hidden_dim,
+            fusion_mode=config.fusion_mode,
+            fusion_dropout=config.fusion_dropout,
+            train_image_backbone=config.train_image_backbone,
+            download_pretrained_backbone=config.download_pretrained_backbone,
+            backbone_weights_path=resolve_weights_path(
+                config.backbone_weights_path, fold_index
+            ),
+        )
+
+    if mode in {"both", "tabular_only"}:
+        kwargs.update(
+            n_tab_features=n_tab_features,
+            use_tabm_tabular=config.use_tabm_tabular,
+            tab_dropout=config.tab_dropout,
+            bins=bins,
+            d_embedding=config.d_embedding,
+            cat_cardinalities=cat_cardinalities,
+        )
+        if config.use_tabm_tabular:
+            kwargs.update(
+                tabm_arch_type=config.tabm_arch_type,
+                tabm_k=config.tabm_k,
+                tabm_n_blocks=config.tabm_n_blocks,
+                tabm_d_block=config.tabm_d_block,
+            )
+        else:
+            kwargs["tab_hidden_dim"] = config.tab_hidden_dim
+
+    if mode == "both":
+        kwargs["modality_dropout_prob"] = config.modality_dropout_prob
+        if str(config.fusion_mode).strip().lower() == "cross_attention":
+            kwargs.update(
+                cross_attention_heads=config.cross_attention_heads,
+                cross_attention_dropout=config.cross_attention_dropout,
+            )
+
+    return kwargs
+
+
 
 
 
@@ -232,44 +370,51 @@ def _run_stage1_tabular(
     history = []
     best_tab_score = 0.0
     if config.pretrained_tabular_dir is not None:
-        pt_dir = config.pretrained_tabular_dir
-        if "{fold}" in pt_dir or "{fold_1}" in pt_dir:
-            tab_path = Path(pt_dir.format(fold=fold_index, fold_1=fold_index + 1))
-        else:
-            tab_path = Path(pt_dir) / f"mid_fusion_lite_fold_{fold_index}.pt"
-            
-        if tab_path.exists():
+        tab_source = str(config.pretrained_tabular_dir)
+        tab_path = _resolve_pretrained_checkpoint(
+            tab_source, fold_index=fold_index, branch="tabular"
+        )
+        if tab_path is not None:
             print(f"\n[Stage 1] Loading pre-trained tabular weights from checkpoint: {tab_path}")
             best_tab_state = torch.load(tab_path, map_location="cpu", weights_only=True)
+        elif resolve_run_mode(config) == "fusion":
+            raise _missing_stage3_checkpoint_error(
+                tab_source, fold_index=fold_index, branch="tabular"
+            )
         else:
-            print(f"\n[Stage 1] WARNING: Pretrained tabular checkpoint not found at {tab_path}. Training from scratch...")
+            print(
+                "\n[Stage 1] WARNING: Pretrained tabular checkpoint not found "
+                f"under {tab_source}. Training from scratch..."
+            )
+    elif resolve_run_mode(config) == "fusion":
+        raise _missing_stage3_checkpoint_error(
+            "<not configured>", fold_index=fold_index, branch="tabular"
+        )
 
     if best_tab_state is None:
         print(f"\n[Stage 1] Pretraining Tabular encoder (epochs={config.stage1_epochs})...")
-        model_tab = MidFusionLiteModel(
-            backbone_name=config.backbone_name,
-            n_tab_features=x_train_shape,
-            use_tabm_tabular=config.use_tabm_tabular,
-            tab_hidden_dim=config.tab_hidden_dim,
-            tabm_arch_type=config.tabm_arch_type,
-            tabm_k=config.tabm_k,
-            tabm_n_blocks=config.tabm_n_blocks,
-            tabm_d_block=config.tabm_d_block,
-            fusion_hidden_dim=config.fusion_hidden_dim,
-            fusion_mode=config.fusion_mode,
-            cross_attention_heads=config.cross_attention_heads,
-            cross_attention_dropout=config.cross_attention_dropout,
-            tab_dropout=config.tab_dropout,
-            fusion_dropout=config.fusion_dropout,
-            train_image_backbone=False,
-            download_pretrained_backbone=False,
-            modality_dropout_prob=0.0,
-            modality_mode="tabular_only",
-            bins=bins,
-            d_embedding=config.d_embedding,
-            init_bias=None,
-            cat_cardinalities=cat_cardinalities,
-        ).to(device)
+        init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
+        tabular_model_kwargs: dict[str, Any] = {
+            "n_tab_features": x_train_shape,
+            "use_tabm_tabular": config.use_tabm_tabular,
+            "tab_dropout": config.tab_dropout,
+            "modality_mode": "tabular_only",
+            "bins": bins,
+            "d_embedding": config.d_embedding,
+            "cat_cardinalities": cat_cardinalities,
+            "init_bias": init_bias,
+        }
+        if config.use_tabm_tabular:
+            tabular_model_kwargs.update(
+                tabm_arch_type=config.tabm_arch_type,
+                tabm_k=config.tabm_k,
+                tabm_n_blocks=config.tabm_n_blocks,
+                tabm_d_block=config.tabm_d_block,
+            )
+        else:
+            tabular_model_kwargs["tab_hidden_dim"] = config.tab_hidden_dim
+
+        model_tab = MidFusionLiteModel(**tabular_model_kwargs).to(device)
 
         _initialize_lazy_parameters(model_tab, device, config.image_size, x_train_shape)
 
@@ -350,14 +495,10 @@ def _run_stage1_tabular(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        # Save Stage 1 checkpoint so it can be reloaded without retraining.
-        # Uses pretrained_tabular_dir if set, otherwise output_dir/stage1_tabular/.
+        # Kaggle input datasets are read-only. Newly trained checkpoints always
+        # belong in output_dir, never in the pre-trained source directory.
         if best_tab_state is not None and config.save_checkpoints:
-            save_dir = Path(
-                config.pretrained_tabular_dir
-                if config.pretrained_tabular_dir is not None
-                else Path(config.output_dir) / "stage1_tabular"
-            )
+            save_dir = Path(config.output_dir) / "stage1_tabular"
             save_dir.mkdir(parents=True, exist_ok=True)
             save_path = save_dir / f"mid_fusion_lite_fold_{fold_index}.pt"
             torch.save(best_tab_state, save_path)
@@ -374,41 +515,45 @@ def _run_stage2_image(
     device: torch.device,
     pos_weight: float,
     x_train_shape: int,
-) -> Optional[dict[str, torch.Tensor]]:
+) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]], float]:
     best_img_state = None
+    history: list[dict[str, Any]] = []
+    best_img_score = 0.0
     if config.pretrained_image_dir is not None:
-        img_path = Path(config.pretrained_image_dir) / f"mid_fusion_lite_fold_{fold_index}.pt"
-        if img_path.exists():
+        image_source = str(config.pretrained_image_dir)
+        img_path = _resolve_pretrained_checkpoint(
+            image_source, fold_index=fold_index, branch="image"
+        )
+        if img_path is not None:
             print(f"\n[Stage 2] Loading pre-trained image weights from checkpoint: {img_path}")
             best_img_state = torch.load(img_path, map_location="cpu", weights_only=True)
+        elif resolve_run_mode(config) == "fusion":
+            raise _missing_stage3_checkpoint_error(
+                image_source, fold_index=fold_index, branch="image"
+            )
         else:
-            print(f"\n[Stage 2] WARNING: Pretrained image checkpoint not found at {img_path}. Training from scratch...")
+            print(
+                "\n[Stage 2] WARNING: Pretrained image checkpoint not found "
+                f"under {image_source}. Training from scratch..."
+            )
+    elif resolve_run_mode(config) == "fusion":
+        raise _missing_stage3_checkpoint_error(
+            "<not configured>", fold_index=fold_index, branch="image"
+        )
 
     if best_img_state is None:
         print(f"\n[Stage 2] Pretraining Image encoder (epochs={config.stage2_epochs})...")
+        init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
         model_img = MidFusionLiteModel(
             backbone_name=config.backbone_name,
-            n_tab_features=x_train_shape,
-            use_tabm_tabular=False,
-            tab_hidden_dim=config.tab_hidden_dim,
-            tabm_arch_type=config.tabm_arch_type,
-            tabm_k=config.tabm_k,
-            tabm_n_blocks=config.tabm_n_blocks,
-            tabm_d_block=config.tabm_d_block,
             fusion_hidden_dim=config.fusion_hidden_dim,
             fusion_mode=config.fusion_mode,
-            cross_attention_heads=config.cross_attention_heads,
-            cross_attention_dropout=config.cross_attention_dropout,
-            tab_dropout=config.tab_dropout,
             fusion_dropout=config.fusion_dropout,
             train_image_backbone=config.stage2_train_backbone,
             download_pretrained_backbone=config.download_pretrained_backbone,
             backbone_weights_path=resolve_weights_path(config.backbone_weights_path, fold_index),
-            modality_dropout_prob=0.0,
             modality_mode="image_only",
-            bins=None,
-            d_embedding=config.d_embedding,
-            init_bias=None,
+            init_bias=init_bias,
         ).to(device)
 
         _initialize_lazy_parameters(model_img, device, config.image_size, x_train_shape)
@@ -431,7 +576,7 @@ def _run_stage2_image(
                 opt_img, T_max=max(1, config.stage2_epochs), eta_min=config.min_lr
             )
 
-        best_img_state, _, _ = fit_one_fold(
+        best_img_state, history, best_img_score = fit_one_fold(
             model=model_img,
             train_loader=train_loader,
             valid_loader=valid_loader,
@@ -457,17 +602,16 @@ def _run_stage2_image(
         # This is the cleanest image-only checkpoint — before Stage 3 fusion distorts image_head.
         # Uses pretrained_image_dir if set, otherwise output_dir/stage2_image/.
         if best_img_state is not None and config.save_checkpoints:
-            save_dir = Path(
-                config.pretrained_image_dir
-                if config.pretrained_image_dir is not None
-                else Path(config.output_dir) / "stage2_image"
-            )
+            # Never write into a pre-trained source such as /kaggle/input.
+            save_dir = Path(config.output_dir) / "stage2_image"
             save_dir.mkdir(parents=True, exist_ok=True)
             save_path = save_dir / f"mid_fusion_lite_fold_{fold_index}.pt"
             torch.save(best_img_state, save_path)
             print(f"  [Stage 2] Checkpoint saved → {save_path}")
 
-    return best_img_state
+    if best_img_state is None:
+        raise RuntimeError("Stage 2 did not produce or load an image checkpoint")
+    return best_img_state, history, float(best_img_score)
 
 
 def _run_stage3_fusion(
@@ -486,29 +630,15 @@ def _run_stage3_fusion(
     print(f"\n[Stage 3] Fusion & Fine-Tuning...")
     init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
     model = MidFusionLiteModel(
-        backbone_name=config.backbone_name,
-        n_tab_features=x_train_shape,
-        use_tabm_tabular=config.use_tabm_tabular,
-        tab_hidden_dim=config.tab_hidden_dim,
-        tabm_arch_type=config.tabm_arch_type,
-        tabm_k=config.tabm_k,
-        tabm_n_blocks=config.tabm_n_blocks,
-        tabm_d_block=config.tabm_d_block,
-        fusion_hidden_dim=config.fusion_hidden_dim,
-        fusion_mode=config.fusion_mode,
-        cross_attention_heads=config.cross_attention_heads,
-        cross_attention_dropout=config.cross_attention_dropout,
-        tab_dropout=config.tab_dropout,
-        fusion_dropout=config.fusion_dropout,
-        train_image_backbone=config.train_image_backbone,
-        download_pretrained_backbone=config.download_pretrained_backbone,
-        backbone_weights_path=resolve_weights_path(config.backbone_weights_path, fold_index),
-        modality_dropout_prob=config.modality_dropout_prob,
-        modality_mode="both",
-        bins=bins,
-        d_embedding=config.d_embedding,
-        init_bias=init_bias,
-        cat_cardinalities=cat_cardinalities,
+        **_model_kwargs_for_mode(
+            config=config,
+            modality_mode="both",
+            n_tab_features=x_train_shape,
+            bins=bins,
+            init_bias=init_bias,
+            cat_cardinalities=cat_cardinalities,
+            fold_index=fold_index,
+        )
     ).to(device)
 
     _initialize_lazy_parameters(model, device, config.image_size, x_train_shape)
@@ -668,8 +798,14 @@ def _run_staged_pretraining_for_fold(
     bins: Any,
     cat_cardinalities: Optional[list[int]] = None,
 ) -> tuple[dict[str, torch.Tensor], list[dict[str, float]], float]:
+    run_mode = resolve_run_mode(config)
+    training_title = (
+        "STAGE 3 FUSION FROM PRETRAINED BRANCHES"
+        if run_mode == "fusion"
+        else "3-STAGE PROGRESSIVE TRAINING"
+    )
     print(f"\n" + "=" * 80)
-    print(f"  >>> RUNNING 3-STAGE PROGRESSIVE TRAINING FOR FOLD {fold_index + 1} <<<")
+    print(f"  >>> RUNNING {training_title} FOR FOLD {fold_index + 1} <<<")
     print("=" * 80)
 
     best_tab_state, _, _ = _run_stage1_tabular(
@@ -677,7 +813,7 @@ def _run_staged_pretraining_for_fold(
         cat_cardinalities=cat_cardinalities,
     )
 
-    best_img_state = _run_stage2_image(
+    best_img_state, _, _ = _run_stage2_image(
         fold_index, config, train_loader, valid_loader, device, pos_weight, x_train_shape
     )
 
@@ -689,6 +825,19 @@ def _run_staged_pretraining_for_fold(
 
 def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Callable[[int, float], None]] = None) -> dict[str, Any]:
     config = resolve_data_paths(config)
+
+    run_mode = resolve_run_mode(config)
+    # Preserve epoch/backbone semantics for legacy non-staged unimodal configs.
+    if config.run_mode is None and not bool(config.use_staged_pretraining):
+        if run_mode == "tabular_only":
+            config = config.with_updates(stage1_epochs=config.epochs)
+        elif run_mode == "image_only":
+            config = config.with_updates(
+                stage2_epochs=config.epochs,
+                stage2_train_backbone=config.train_image_backbone,
+            )
+    stage_modality_mode = modality_mode_for_run_mode(run_mode)
+    uses_stage_runner = run_mode != "end_to_end"
 
     if config.backbone_weights_path:
         if "{fold}" not in config.backbone_weights_path and not Path(config.backbone_weights_path).exists():
@@ -704,11 +853,13 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
     output_dir = _ensure_output_dir(config.output_dir)
 
     print(f"Running preset: {config.preset_name}")
+    print(f"Run mode: {run_mode}")
     print(f"Device: {device.type.upper()}")
     print(f"Output directory: {output_dir.resolve()}")
 
-    requested_numeric_cols = set(config.numeric_cols)
-    if bool(config.use_feature_engineering):
+    uses_tabular_data = stage_modality_mode != "image_only"
+    requested_numeric_cols = set(config.numeric_cols) if uses_tabular_data else set()
+    if uses_tabular_data and bool(config.use_feature_engineering):
         requested_numeric_cols.update(BASE_NUMERIC_COLS)
 
     requested_train_cols = {
@@ -716,13 +867,13 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
         config.target_col,
         config.group_col,
         "tbp_lv_nevi_confidence", # Ensure this is read for hard negative mining
-        *config.categorical_cols,
+        *(config.categorical_cols if uses_tabular_data else []),
         *requested_numeric_cols,
     }
     requested_test_cols = {
         config.id_col,
         config.group_col,
-        *config.categorical_cols,
+        *(config.categorical_cols if uses_tabular_data else []),
         *requested_numeric_cols,
     }
 
@@ -744,8 +895,10 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
     # train+valid together. Instead, add_feature_engineering_folds is called INSIDE the
     # fold loop below, fitting stats on fold-train only. Column selection likewise moves
     # into the loop (the engineered column set is deterministic across folds).
-    if not bool(config.use_feature_engineering):
+    if uses_tabular_data and not bool(config.use_feature_engineering):
         print("Skipping heavy feature engineering (use_feature_engineering=False).")
+    elif not uses_tabular_data:
+        print("Skipping tabular feature engineering for image-only Stage 2.")
 
     y = train_df[config.target_col].astype(np.int64).to_numpy()
     groups = train_df[config.group_col].to_numpy()
@@ -802,7 +955,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
         # is left untouched (the helper copies internally) so each fold re-derives its own
         # fold_test_df — required because the fold-train statistics differ per fold.
         fold_test_df = test_df
-        if bool(config.use_feature_engineering):
+        if uses_tabular_data and bool(config.use_feature_engineering):
             try:
                 fold_train_df, fold_valid_df, fold_test_df = add_feature_engineering_folds(
                     fold_train_df=fold_train_df,
@@ -823,42 +976,51 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
                 gc.collect()
                 fold_test_df = test_df
 
-        # Column selection is deterministic across folds (engineered names are fixed), but
-        # must run on engineered frames, so it lives here rather than before the loop.
-        numeric_cols, categorical_cols = select_available_columns(
-            train_df=fold_train_df,
-            test_df=fold_test_df,
-            numeric_candidates=config.numeric_cols,
-            categorical_candidates=config.categorical_cols,
-        )
-        print(f"Numeric features: {len(numeric_cols)} | Categorical features: {len(categorical_cols)}")
-
         y_train = fold_train_df[config.target_col].astype(np.float32).to_numpy()
         y_valid = fold_valid_df[config.target_col].astype(np.float32).to_numpy()
 
         # We pass the full dataset to the preprocessor and dataloader.
         # Undersampling is dynamically handled by make_balanced_sampler per epoch.
         fold_train_df_sampled = fold_train_df
-        preprocessor = FoldTabularPreprocessor(
-            numeric_cols=numeric_cols,
-            categorical_cols=categorical_cols,
-            use_quantile_transform=(
-                bool(config.use_quantile_transform) and bool(config.use_tabm_tabular)
-            ),
-            quantile_noise_std=float(config.quantile_noise_std),
-            quantile_random_state=config.seed + fold_index + 1,
-            use_null_importance_filter=bool(config.use_null_importance_filter),
-            null_importance_repeats=int(config.null_importance_repeats),
-            null_importance_quantile=float(config.null_importance_quantile),
-            null_importance_min_kept=int(config.null_importance_min_kept),
-            target_col=config.target_col,
-            categorical_as_codes=bool(config.use_tabm_tabular),
-        )
-        preprocessor.fit(fold_train_df_sampled)
-
-        x_train_sampled = preprocessor.transform(fold_train_df_sampled)
-        x_valid = preprocessor.transform(fold_valid_df)
-        x_test = preprocessor.transform(fold_test_df)
+        if uses_tabular_data:
+            # Column selection is deterministic across folds (engineered names are fixed),
+            # but must run on engineered frames to avoid leakage.
+            numeric_cols, categorical_cols = select_available_columns(
+                train_df=fold_train_df,
+                test_df=fold_test_df,
+                numeric_candidates=config.numeric_cols,
+                categorical_candidates=config.categorical_cols,
+            )
+            print(
+                f"Numeric features: {len(numeric_cols)} | "
+                f"Categorical features: {len(categorical_cols)}"
+            )
+            preprocessor = FoldTabularPreprocessor(
+                numeric_cols=numeric_cols,
+                categorical_cols=categorical_cols,
+                use_quantile_transform=(
+                    bool(config.use_quantile_transform)
+                    and bool(config.use_tabm_tabular)
+                ),
+                quantile_noise_std=float(config.quantile_noise_std),
+                quantile_random_state=config.seed + fold_index + 1,
+                use_null_importance_filter=bool(config.use_null_importance_filter),
+                null_importance_repeats=int(config.null_importance_repeats),
+                null_importance_quantile=float(config.null_importance_quantile),
+                null_importance_min_kept=int(config.null_importance_min_kept),
+                target_col=config.target_col,
+                categorical_as_codes=bool(config.use_tabm_tabular),
+            )
+            preprocessor.fit(fold_train_df_sampled)
+            x_train_sampled = preprocessor.transform(fold_train_df_sampled)
+            x_valid = preprocessor.transform(fold_valid_df)
+            x_test = preprocessor.transform(fold_test_df)
+        else:
+            # The dataset/model API expects a tabular tensor, but Stage 2 never reads it.
+            preprocessor = None
+            x_train_sampled = np.zeros((len(fold_train_df_sampled), 1), dtype=np.float32)
+            x_valid = np.zeros((len(fold_valid_df), 1), dtype=np.float32)
+            x_test = np.zeros((len(fold_test_df), 1), dtype=np.float32)
 
         y_train_sampled = fold_train_df_sampled[config.target_col].astype(np.float32).to_numpy()
         ids_train_sampled = fold_train_df_sampled[config.id_col].astype(str).to_numpy()
@@ -870,7 +1032,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             targets=y_train_sampled,
             transforms=transforms["train"],
             use_shades_of_gray=bool(config.use_shades_of_gray),
-            modality_mode=config.modality_mode,
+            modality_mode=stage_modality_mode,
             image_size=config.image_size,
         )
         valid_dataset = HDF5ImageTabularDataset(
@@ -880,7 +1042,7 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             targets=y_valid,
             transforms=transforms["valid"],
             use_shades_of_gray=bool(config.use_shades_of_gray),
-            modality_mode=config.modality_mode,
+            modality_mode=stage_modality_mode,
             image_size=config.image_size,
         )
         test_dataset = HDF5ImageTabularDataset(
@@ -890,11 +1052,11 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             targets=None,
             transforms=transforms["valid"],
             use_shades_of_gray=bool(config.use_shades_of_gray),
-            modality_mode=config.modality_mode,
+            modality_mode=stage_modality_mode,
             image_size=config.image_size,
         )
 
-        if getattr(config, "tabular_full_data", False) and getattr(config, "stage_to_run", "all") == "stage1":
+        if getattr(config, "tabular_full_data", False) and run_mode == "tabular_only":
             # For tree models or pure tabular pretraining on full data, no undersampling
             train_sampler = None
             train_shuffle = True
@@ -939,12 +1101,14 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
         # Categorical features are fed to TabM as integer codes (one column each, appended
         # after the numeric block) via cat_cardinalities; PLE bins cover numeric features only.
         cat_cardinalities = (
-            list(preprocessor.cat_cardinalities) if config.use_tabm_tabular else None
+            list(preprocessor.cat_cardinalities)
+            if preprocessor is not None and config.use_tabm_tabular
+            else None
         )
-        n_numeric = int(preprocessor.n_numeric_out)
+        n_numeric = int(preprocessor.n_numeric_out) if preprocessor is not None else 0
 
         bins = None
-        if config.use_tabm_tabular and n_numeric > 0:
+        if uses_tabular_data and config.use_tabm_tabular and n_numeric > 0:
             import rtdl_num_embeddings
             x_train_tensor = torch.tensor(x_train_sampled[:, :n_numeric], dtype=torch.float32)
             raw_bins = rtdl_num_embeddings.compute_bins(
@@ -980,36 +1144,47 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
         # (e.g. Stage 1 at 1:100, Stage 2 at 1:1, Stage 3 at 1:2), so the log should only
         # describe the stage that actually trains in THIS run — not lump Stage 2/3 together.
         neg_ratio = int(max(float(config.negative_ratio), 1.0))
-        stage_to_run = getattr(config, "stage_to_run", "all")
-        if not bool(config.use_staged_pretraining):
-            run_label = "end-to-end (both)"
-        elif stage_to_run == "stage1":
-            run_label = "Stage 1 (tabular)"
-        elif stage_to_run == "stage2":
-            run_label = "Stage 2 (image)"
-        elif stage_to_run == "stage3":
-            run_label = "Stage 3 (fusion)"
-        else:
-            run_label = "Stage 1->3 (staged)"
+        run_label = {
+            "tabular_only": "Tabular only",
+            "image_only": "Image only",
+            "fusion": "Fusion",
+            "progressive": "Progressive tabular -> image -> fusion",
+            "end_to_end": "End-to-end fusion",
+        }[run_mode]
 
         # No sampler only in the tabular full-data pretraining special case; otherwise the
         # balanced sampler (negative_ratio:1) is active and pos_weight_sampled applies.
         stage1_no_sampler = (
-            bool(getattr(config, "tabular_full_data", False)) and stage_to_run == "stage1"
+            bool(getattr(config, "tabular_full_data", False))
+            and run_mode == "tabular_only"
         )
         if stage1_no_sampler:
             print(f"  [{run_label}] no sampler (tabular full-data) -> pos_weight_full={pos_weight_full:.3f}")
         else:
             print(f"  [{run_label}] sampler 1:{neg_ratio} -> pos_weight_sampled={pos_weight_sampled:.3f}")
 
-        if bool(config.use_staged_pretraining):
-            if getattr(config, "stage_to_run", "all") == "stage1":
+        if uses_stage_runner:
+            if run_mode == "tabular_only":
                 print(f"\n  >>> RUNNING STAGE 1 (TABULAR ONLY) FOR FOLD {fold_index + 1} <<<")
                 # Stage 1 with tabular_full_data uses no sampler → use full-data pos_weight
                 stage1_pos_weight = pos_weight_full if getattr(config, "tabular_full_data", False) else pos_weight_sampled
                 best_state, history, best_valid_score = _run_stage1_tabular(
                     fold_index, config, train_loader, valid_loader, device, stage1_pos_weight, x_train_sampled.shape[1], bins,
                     cat_cardinalities=cat_cardinalities,
+                )
+            elif run_mode == "image_only":
+                print(
+                    f"\n  >>> RUNNING STAGE 2 (IMAGE ONLY) FOR FOLD "
+                    f"{fold_index + 1} <<<"
+                )
+                best_state, history, best_valid_score = _run_stage2_image(
+                    fold_index=fold_index,
+                    config=config,
+                    train_loader=train_loader,
+                    valid_loader=valid_loader,
+                    device=device,
+                    pos_weight=pos_weight_sampled,
+                    x_train_shape=x_train_sampled.shape[1],
                 )
             else:
                 best_state, history, best_valid_score = _run_staged_pretraining_for_fold(
@@ -1033,58 +1208,30 @@ def run_mid_fusion_cv(config: MidFusionLiteConfig, epoch_callback: Optional[Call
             # Recreate model so we can load the best stage weights and run inference
             init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
             model = MidFusionLiteModel(
-                backbone_name=config.backbone_name,
-                n_tab_features=x_train_sampled.shape[1],
-                use_tabm_tabular=config.use_tabm_tabular,
-                tab_hidden_dim=config.tab_hidden_dim,
-                tabm_arch_type=config.tabm_arch_type,
-                tabm_k=config.tabm_k,
-                tabm_n_blocks=config.tabm_n_blocks,
-                tabm_d_block=config.tabm_d_block,
-                fusion_hidden_dim=config.fusion_hidden_dim,
-                fusion_mode=config.fusion_mode,
-                cross_attention_heads=config.cross_attention_heads,
-                cross_attention_dropout=config.cross_attention_dropout,
-                tab_dropout=config.tab_dropout,
-                fusion_dropout=config.fusion_dropout,
-                train_image_backbone=config.train_image_backbone,
-                download_pretrained_backbone=config.download_pretrained_backbone,
-                backbone_weights_path=resolve_weights_path(config.backbone_weights_path, fold_index),
-                modality_dropout_prob=config.modality_dropout_prob,
-                modality_mode=config.modality_mode,
-                bins=bins,
-                d_embedding=config.d_embedding,
-                init_bias=init_bias,
-                cat_cardinalities=cat_cardinalities,
+                **_model_kwargs_for_mode(
+                    config=config,
+                    modality_mode=stage_modality_mode,
+                    n_tab_features=x_train_sampled.shape[1],
+                    bins=bins,
+                    init_bias=init_bias,
+                    cat_cardinalities=cat_cardinalities,
+                    fold_index=fold_index,
+                )
             ).to(device)
             _initialize_lazy_parameters(model, device, config.image_size, x_train_sampled.shape[1])
             model.load_state_dict(best_state)
         else:
             init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
             model = MidFusionLiteModel(
-                backbone_name=config.backbone_name,
-                n_tab_features=x_train_sampled.shape[1],
-                use_tabm_tabular=config.use_tabm_tabular,
-                tab_hidden_dim=config.tab_hidden_dim,
-                tabm_arch_type=config.tabm_arch_type,
-                tabm_k=config.tabm_k,
-                tabm_n_blocks=config.tabm_n_blocks,
-                tabm_d_block=config.tabm_d_block,
-                fusion_hidden_dim=config.fusion_hidden_dim,
-                fusion_mode=config.fusion_mode,
-                cross_attention_heads=config.cross_attention_heads,
-                cross_attention_dropout=config.cross_attention_dropout,
-                tab_dropout=config.tab_dropout,
-                fusion_dropout=config.fusion_dropout,
-                train_image_backbone=config.train_image_backbone,
-                download_pretrained_backbone=config.download_pretrained_backbone,
-                backbone_weights_path=resolve_weights_path(config.backbone_weights_path, fold_index),
-                modality_dropout_prob=config.modality_dropout_prob,
-                modality_mode=config.modality_mode,
-                bins=bins,
-                d_embedding=config.d_embedding,
-                init_bias=init_bias,
-                cat_cardinalities=cat_cardinalities,
+                **_model_kwargs_for_mode(
+                    config=config,
+                    modality_mode=stage_modality_mode,
+                    n_tab_features=x_train_sampled.shape[1],
+                    bins=bins,
+                    init_bias=init_bias,
+                    cat_cardinalities=cat_cardinalities,
+                    fold_index=fold_index,
+                )
             )
             model = model.to(device)
             _initialize_lazy_parameters(
@@ -1291,6 +1438,12 @@ def main() -> None:
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument(
+        "--run-mode",
+        choices=["tabular_only", "image_only", "fusion", "progressive", "end_to_end"],
+        default=None,
+    )
+    # Deprecated compatibility flag; equivalent to --run-mode progressive.
     parser.add_argument("--staged-training", action="store_true", default=False)
     parser.add_argument("--stage1-epochs", type=int, default=None)
     parser.add_argument("--stage2-epochs", type=int, default=None)
@@ -1316,8 +1469,10 @@ def main() -> None:
         updates["epochs"] = args.epochs
     if args.image_size is not None:
         updates["image_size"] = args.image_size
-    if args.staged_training:
-        updates["use_staged_pretraining"] = True
+    if args.run_mode is not None:
+        updates["run_mode"] = args.run_mode
+    elif args.staged_training:
+        updates["run_mode"] = "progressive"
     if args.stage1_epochs is not None:
         updates["stage1_epochs"] = args.stage1_epochs
     if args.stage2_epochs is not None:

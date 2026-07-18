@@ -137,11 +137,33 @@ class CrossModalAttentionFusion(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(
-        self, image_features: torch.Tensor, tab_features: torch.Tensor
+        self,
+        image_features: torch.Tensor,
+        tab_features: torch.Tensor,
+        image_keep_mask: Optional[torch.Tensor] = None,
+        tab_keep_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # image_features: (B, L, hidden_dim) where L is number of spatial patches
         # tab_features: (B, hidden_dim)
-        tab_token = tab_features.unsqueeze(1)  # (B, 1, hidden_dim)
+        batch_size = image_features.size(0)
+        if image_keep_mask is None:
+            image_keep_mask = image_features.new_ones((batch_size, 1))
+        if tab_keep_mask is None:
+            tab_keep_mask = tab_features.new_ones((batch_size, 1))
+
+        image_keep_mask = image_keep_mask.to(
+            device=image_features.device, dtype=image_features.dtype
+        ).reshape(batch_size, 1, 1)
+        tab_keep_mask = tab_keep_mask.to(
+            device=tab_features.device, dtype=tab_features.dtype
+        ).reshape(batch_size, 1, 1)
+        interaction_mask = image_keep_mask * tab_keep_mask
+
+        # Mask both the residual stream and the cross-modal context. Masking only
+        # before the projection is insufficient because Linear/MHA biases can
+        # otherwise recreate a non-zero representation for a missing modality.
+        image_features = image_features * image_keep_mask
+        tab_token = tab_features.unsqueeze(1) * tab_keep_mask  # (B, 1, hidden_dim)
 
         norm_image = self.image_norm(image_features)
         norm_tab = self.tab_norm(tab_token)
@@ -165,8 +187,8 @@ class CrossModalAttentionFusion(nn.Module):
             need_weights=False,
         )
 
-        image_out = image_features + self.dropout(image_ctx)  # (B, L, D)
-        tab_out = tab_token + self.dropout(tab_ctx)  # (B, 1, D)
+        image_out = image_features + interaction_mask * self.dropout(image_ctx)
+        tab_out = tab_token + interaction_mask * self.dropout(tab_ctx)
 
         # Average pooling over spatial dimensions
         image_out_pooled = image_out.mean(dim=1)  # (B, D)
@@ -190,40 +212,70 @@ class GatedMultimodalUnit(nn.Module):
         self.tab_transform = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(
-        self, image_features: torch.Tensor, tab_features: torch.Tensor
+        self,
+        image_features: torch.Tensor,
+        tab_features: torch.Tensor,
+        image_keep_mask: Optional[torch.Tensor] = None,
+        tab_keep_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        concat_features = torch.cat([image_features, tab_features], dim=1)
+        batch_size = image_features.size(0)
+        if image_keep_mask is None:
+            image_keep_mask = image_features.new_ones((batch_size, 1))
+        if tab_keep_mask is None:
+            tab_keep_mask = tab_features.new_ones((batch_size, 1))
+
+        image_keep_mask = image_keep_mask.to(
+            device=image_features.device, dtype=image_features.dtype
+        ).reshape(batch_size, 1)
+        tab_keep_mask = tab_keep_mask.to(
+            device=tab_features.device, dtype=tab_features.dtype
+        ).reshape(batch_size, 1)
+
+        masked_image = image_features * image_keep_mask
+        masked_tab = tab_features * tab_keep_mask
+        concat_features = torch.cat([masked_image, masked_tab], dim=1)
         z = self.image_gate(concat_features)  # (B, 1)
 
-        h_image = self.image_transform(image_features)
-        h_tab = self.tab_transform(tab_features)
+        # Apply the mask again after Linear so a learned bias cannot recreate a
+        # representation for the missing branch.
+        h_image = self.image_transform(masked_image) * image_keep_mask
+        h_tab = self.tab_transform(masked_tab) * tab_keep_mask
 
-        # GMU equation
-        fused = z * h_image + (1.0 - z) * h_tab
+        both_present = image_keep_mask * tab_keep_mask
+        image_only = image_keep_mask * (1.0 - tab_keep_mask)
+        tab_only = (1.0 - image_keep_mask) * tab_keep_mask
+
+        # Use the learned GMU gate when both modalities exist. If one modality is
+        # missing, fall back directly to the available transformed feature.
+        fused = (
+            both_present * (z * h_image + (1.0 - z) * h_tab)
+            + image_only * h_image
+            + tab_only * h_tab
+        )
         return fused
 
 
 class MidFusionLiteModel(nn.Module):
     def __init__(
         self,
-        backbone_name: str,
-        n_tab_features: int,
-        use_tabm_tabular: bool,
-        tab_hidden_dim: int,
-        tabm_arch_type: str,
-        tabm_k: int,
-        tabm_n_blocks: int,
-        tabm_d_block: int,
-        fusion_hidden_dim: int,
-        fusion_mode: str,
-        cross_attention_heads: int,
-        cross_attention_dropout: float,
-        tab_dropout: float,
-        fusion_dropout: float,
+        backbone_name: Optional[str] = None,
+        n_tab_features: Optional[int] = None,
+        use_tabm_tabular: Optional[bool] = None,
+        tab_hidden_dim: Optional[int] = None,
+        tabm_arch_type: Optional[str] = None,
+        tabm_k: Optional[int] = None,
+        tabm_n_blocks: Optional[int] = None,
+        tabm_d_block: Optional[int] = None,
+        fusion_hidden_dim: Optional[int] = None,
+        fusion_mode: Optional[str] = None,
+        cross_attention_heads: Optional[int] = None,
+        cross_attention_dropout: Optional[float] = None,
+        tab_dropout: Optional[float] = None,
+        fusion_dropout: Optional[float] = None,
         train_image_backbone: bool = False,
         download_pretrained_backbone: bool = False,
         backbone_weights_path: str | None = None,
-        modality_dropout_prob: float = 0.15,
+        modality_dropout_prob: Optional[float] = None,
         modality_mode: str = "both",
         bins: Optional[list[list[float]]] = None,
         d_embedding: int = 24,
@@ -239,18 +291,43 @@ class MidFusionLiteModel(nn.Module):
                 "modality_mode must be: 'both', 'image_only', 'tabular_only'"
             )
 
-        self.fusion_mode = str(fusion_mode).strip().lower()
+        uses_image = self.modality_mode in {"both", "image_only"}
+        uses_tabular = self.modality_mode in {"both", "tabular_only"}
+
+        def require(name: str, value):
+            if value is None:
+                raise ValueError(
+                    f"{name} is required when modality_mode='{self.modality_mode}'"
+                )
+            return value
+
+        # fusion_mode controls spatial vs pooled image features, so it remains
+        # relevant for image_only checkpoints. It is unused for tabular_only.
+        resolved_fusion_mode = (
+            require("fusion_mode", fusion_mode) if uses_image else (fusion_mode or "concat")
+        )
+        self.fusion_mode = str(resolved_fusion_mode).strip().lower()
         if self.fusion_mode not in {"concat", "cross_attention", "gmu"}:
             raise ValueError(
                 "fusion_mode must be one of: 'concat', 'cross_attention', 'gmu'"
             )
-        self.modality_dropout_prob = modality_dropout_prob
+
+        if self.modality_mode == "both":
+            modality_dropout_prob = require(
+                "modality_dropout_prob", modality_dropout_prob
+            )
+        self.modality_dropout_prob = float(modality_dropout_prob or 0.0)
+        if not 0.0 <= self.modality_dropout_prob <= 1.0:
+            raise ValueError("modality_dropout_prob must be between 0 and 1")
         self.train_image_backbone = train_image_backbone
         self.keep_tabm_ensemble = keep_tabm_ensemble
-        self.tabm_k = tabm_k if use_tabm_tabular else 1
+        self.tabm_k = 1
 
         # --- IMAGE BRANCH ---
-        if self.modality_mode in ["both", "image_only"]:
+        if uses_image:
+            backbone_name = str(require("backbone_name", backbone_name))
+            fusion_hidden_dim = int(require("fusion_hidden_dim", fusion_hidden_dim))
+            fusion_dropout = float(require("fusion_dropout", fusion_dropout))
             self.image_encoder = self._build_image_encoder(
                 backbone_name=backbone_name,
                 download_pretrained_backbone=download_pretrained_backbone,
@@ -273,11 +350,23 @@ class MidFusionLiteModel(nn.Module):
             self.image_only_head = None
 
         # --- TABULAR BRANCH ---
-        if self.modality_mode in ["both", "tabular_only"]:
+        if uses_tabular:
+            n_tab_features = int(require("n_tab_features", n_tab_features))
+            use_tabm_tabular = bool(
+                require("use_tabm_tabular", use_tabm_tabular)
+            )
+            tab_dropout = float(require("tab_dropout", tab_dropout))
             if use_tabm_tabular:
+                tabm_arch_type = str(require("tabm_arch_type", tabm_arch_type))
+                tabm_k = int(require("tabm_k", tabm_k))
+                tabm_n_blocks = int(require("tabm_n_blocks", tabm_n_blocks))
+                tabm_d_block = int(require("tabm_d_block", tabm_d_block))
+                self.tabm_k = tabm_k
                 self.tabular_encoder = TabMTabularEncoder(
                     in_features=n_tab_features,
-                    hidden_dim=tab_hidden_dim,
+                    # Kept for TabMTabularEncoder API compatibility; TabM uses
+                    # tabm_d_block rather than the MLP-only hidden dimension.
+                    hidden_dim=int(tab_hidden_dim or 0),
                     dropout=tab_dropout,
                     arch_type=tabm_arch_type,
                     k=tabm_k,
@@ -302,6 +391,7 @@ class MidFusionLiteModel(nn.Module):
                 else:
                     self.tabular_only_head = nn.Linear(effective_tab_dim, 1)
             else:
+                tab_hidden_dim = int(require("tab_hidden_dim", tab_hidden_dim))
                 self.tabular_encoder = TabularEncoder(
                     in_features=n_tab_features,
                     hidden_dim=tab_hidden_dim,
@@ -312,11 +402,20 @@ class MidFusionLiteModel(nn.Module):
         else:
             self.tabular_encoder = None
             self.tabular_only_head = None
-            effective_tab_dim = tab_hidden_dim  # fallback, unused
+            effective_tab_dim = 0  # fallback, unused outside two-modality fusion
 
         # --- FUSION BRANCH ---
         if self.modality_mode == "both":
+            # uses_image already resolved these values above.
+            assert fusion_hidden_dim is not None
+            assert fusion_dropout is not None
             if self.fusion_mode == "cross_attention":
+                cross_attention_heads = int(
+                    require("cross_attention_heads", cross_attention_heads)
+                )
+                cross_attention_dropout = float(
+                    require("cross_attention_dropout", cross_attention_dropout)
+                )
                 if fusion_hidden_dim % int(cross_attention_heads) != 0:
                     raise ValueError(
                         "fusion_hidden_dim must be divisible by cross_attention_heads "
@@ -394,6 +493,37 @@ class MidFusionLiteModel(nn.Module):
             elif isinstance(m, nn.BatchNorm1d):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
+
+    def _sample_modality_keep_masks(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return per-sample image/tabular keep masks with shape ``(B, 1)``.
+
+        ``modality_dropout_prob`` is the total probability of dropping exactly
+        one modality. Half of dropped samples lose image and half lose tabular;
+        both modalities are never dropped together. Dropout is restricted to
+        two-modality training, so evaluation and unimodal modes return all ones.
+        """
+        keep = torch.ones((batch_size, 1), device=device, dtype=dtype)
+        if (
+            not self.training
+            or self.modality_mode != "both"
+            or self.modality_dropout_prob <= 0.0
+        ):
+            return keep, keep.clone()
+
+        outcomes = torch.rand((batch_size, 1), device=device)
+        half_probability = self.modality_dropout_prob / 2.0
+        drop_image = outcomes < half_probability
+        drop_tabular = (outcomes >= half_probability) & (
+            outcomes < self.modality_dropout_prob
+        )
+        image_keep = (~drop_image).to(dtype=dtype)
+        tabular_keep = (~drop_tabular).to(dtype=dtype)
+        return image_keep, tabular_keep
 
     def train(self, mode: bool = True) -> "MidFusionLiteModel":
         """Set training mode, but keep a frozen image backbone in eval mode.
@@ -542,10 +672,7 @@ class MidFusionLiteModel(nn.Module):
         if self.modality_mode == "tabular_only":
             tabular_features = self.tabular_encoder(tabular)
             tabular_ensemble_mode = tabular_features.ndim == 3 and self.keep_tabm_ensemble
-            if self.training and self.modality_dropout_prob > 0.0 and not tabular_ensemble_mode:
-                mask = (torch.rand(tabular_features.size(0), 1, device=tabular_features.device) >= self.modality_dropout_prob).float()
-                tabular_features = tabular_features * mask
-            
+
             if tabular_ensemble_mode:
                 if hasattr(self.tabular_only_head, "k"):
                     # LinearEnsemble output is (B, K, 1) -> squeeze to (B, K)
@@ -605,10 +732,9 @@ class MidFusionLiteModel(nn.Module):
         tabular_features = self.tabular_encoder(tabular)
         tabular_ensemble_mode = tabular_features.ndim == 3 and self.keep_tabm_ensemble
 
-        if self.training and self.modality_dropout_prob > 0.0 and not tabular_ensemble_mode:
-            mask = (torch.rand(tabular_features.size(0), 1, device=tabular_features.device) >= self.modality_dropout_prob).float()
-            tabular_features = tabular_features * mask
-
+        # Auxiliary heads always receive clean unimodal features. Modality dropout
+        # regularizes the fusion path only; otherwise a dropped branch would train
+        # its auxiliary classifier mostly through its bias.
         if tabular_ensemble_mode:
             if hasattr(self.tabular_only_head, "k"):
                 tabular_logits = self.tabular_only_head(tabular_features).squeeze(-1)
@@ -620,10 +746,18 @@ class MidFusionLiteModel(nn.Module):
         else:
             tabular_logits = self.tabular_only_head(tabular_features).squeeze(1)
 
+        image_keep_mask, tab_keep_mask = self._sample_modality_keep_masks(
+            batch_size=image_features.size(0),
+            device=image_features.device,
+            dtype=image_features.dtype,
+        )
+
         # Fusion
         if tabular_ensemble_mode:
             B, K, D_tab = tabular_features.shape
             D_img = image_features.shape[-1]
+            image_mask_flat = image_keep_mask.repeat_interleave(K, dim=0)
+            tab_mask_flat = tab_keep_mask.repeat_interleave(K, dim=0)
 
             if self.fusion_mode == "cross_attention":
                 # image_features is 3D [B, seq_len, D_img] for cross_attention
@@ -635,7 +769,12 @@ class MidFusionLiteModel(nn.Module):
                 tab_flat = tabular_features.reshape(B * K, D_tab)
                 projected_tab = self.tab_to_fusion(tab_flat)
 
-                fused = self.cross_modal_fusion(img_for_fusion, projected_tab)
+                fused = self.cross_modal_fusion(
+                    img_for_fusion,
+                    projected_tab,
+                    image_keep_mask=image_mask_flat,
+                    tab_keep_mask=tab_mask_flat,
+                )
                 fused = fused.reshape(B, K, -1)
             elif self.fusion_mode == "gmu":
                 # image_features is 2D [B, D_img] for gmu
@@ -643,12 +782,23 @@ class MidFusionLiteModel(nn.Module):
                 tab_flat = tabular_features.reshape(B * K, D_tab)
                 img_flat = image_features_expanded.reshape(B * K, D_img)
                 projected_tab = self.tab_to_fusion(tab_flat)
-                fused_flat = self.cross_modal_fusion(img_flat, projected_tab)
+                fused_flat = self.cross_modal_fusion(
+                    img_flat,
+                    projected_tab,
+                    image_keep_mask=image_mask_flat,
+                    tab_keep_mask=tab_mask_flat,
+                )
                 fused = fused_flat.reshape(B, K, -1)
             else:
                 # image_features is 2D [B, D_img] for concat
                 image_features_expanded = image_features.unsqueeze(1).expand(-1, K, -1)
-                fused = torch.cat([image_features_expanded, tabular_features], dim=-1)
+                fused = torch.cat(
+                    [
+                        image_features_expanded * image_keep_mask.unsqueeze(1),
+                        tabular_features * tab_keep_mask.unsqueeze(1),
+                    ],
+                    dim=-1,
+                )
 
             B, K, D_fused = fused.shape
             fused_flat = fused.reshape(-1, D_fused)
@@ -657,12 +807,28 @@ class MidFusionLiteModel(nn.Module):
         else:
             if self.fusion_mode == "cross_attention":
                 projected_tab = self.tab_to_fusion(tabular_features)
-                fused = self.cross_modal_fusion(image_features, projected_tab)
+                fused = self.cross_modal_fusion(
+                    image_features,
+                    projected_tab,
+                    image_keep_mask=image_keep_mask,
+                    tab_keep_mask=tab_keep_mask,
+                )
             elif self.fusion_mode == "gmu":
                 projected_tab = self.tab_to_fusion(tabular_features)
-                fused = self.cross_modal_fusion(image_features, projected_tab)
+                fused = self.cross_modal_fusion(
+                    image_features,
+                    projected_tab,
+                    image_keep_mask=image_keep_mask,
+                    tab_keep_mask=tab_keep_mask,
+                )
             else:
-                fused = torch.cat([image_features, tabular_features], dim=1)
+                fused = torch.cat(
+                    [
+                        image_features * image_keep_mask,
+                        tabular_features * tab_keep_mask,
+                    ],
+                    dim=1,
+                )
 
             logits = self.fusion_head(fused).squeeze(1)
 

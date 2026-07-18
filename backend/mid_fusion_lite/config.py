@@ -295,10 +295,13 @@ class MidFusionLiteConfig:
     cross_attention_dropout: float = 0.1
     tab_dropout: float = 0.3
     fusion_dropout: float = 0.2
+    # Total probability that a fusion-training sample drops exactly one modality.
+    # Half of dropped samples lose image and half lose tabular; never both.
     modality_dropout_prob: float = 0.15
     aux_loss_image_weight: float = 0.5
     aux_loss_tab_weight: float = 0.2
-    modality_mode: str = "both"  # "both" | "image_only" | "tabular_only"
+    # Deprecated public selector; retained only to migrate configs with run_mode=None.
+    modality_mode: str = "both"
     train_image_backbone: bool = False
     download_pretrained_backbone: bool = False
 
@@ -327,6 +330,9 @@ class MidFusionLiteConfig:
     train_hdf5_path: Optional[str] = None
     test_hdf5_path: Optional[str] = None
 
+    # Canonical runner selector. None derives the mode from legacy fields.
+    run_mode: Optional[str] = None
+    # Deprecated runner selector; new configs should set only run_mode.
     use_staged_pretraining: bool = False
     # True  → 3-stage pipeline: pretrain tabular-only → pretrain image-only
     #          → freeze encoders & train fusion head → joint fine-tune all
@@ -347,7 +353,7 @@ class MidFusionLiteConfig:
     # stalling at the backbone's tiny lr. Set to 1.0 to disable differential lr.
     stage3b_head_lr_mult: float = 5.0
 
-    stage_to_run: str = "all"  # "all", "stage1", "stage2", "stage3"
+    stage_to_run: str = "all"  # Deprecated; used only when run_mode=None.
     tabular_full_data: bool = False
 
     pretrained_tabular_dir: Optional[str] = None
@@ -360,6 +366,59 @@ class MidFusionLiteConfig:
 
     def with_updates(self, **kwargs) -> "MidFusionLiteConfig":
         return replace(self, **kwargs)
+
+
+VALID_RUN_MODES = {
+    "tabular_only",
+    "image_only",
+    "fusion",
+    "progressive",
+    "end_to_end",
+}
+
+
+def resolve_run_mode(config: MidFusionLiteConfig) -> str:
+    """Resolve the canonical runner mode, including legacy-config migration."""
+    if config.run_mode is not None:
+        run_mode = str(config.run_mode).strip().lower()
+        if run_mode not in VALID_RUN_MODES:
+            allowed = ", ".join(sorted(VALID_RUN_MODES))
+            raise ValueError(f"run_mode must be one of: {allowed}")
+        return run_mode
+
+    if bool(config.use_staged_pretraining):
+        legacy_stage = str(config.stage_to_run).strip().lower()
+        legacy_mapping = {
+            "stage1": "tabular_only",
+            "stage2": "image_only",
+            "stage3": "fusion",
+            "all": "progressive",
+        }
+        if legacy_stage not in legacy_mapping:
+            raise ValueError("stage_to_run must be one of: all, stage1, stage2, stage3")
+        return legacy_mapping[legacy_stage]
+
+    legacy_modality = str(config.modality_mode).strip().lower()
+    if legacy_modality == "tabular_only":
+        return "tabular_only"
+    if legacy_modality == "image_only":
+        return "image_only"
+    if legacy_modality == "both":
+        return "end_to_end"
+    raise ValueError("modality_mode must be: both, image_only, tabular_only")
+
+
+def modality_mode_for_run_mode(run_mode: str) -> str:
+    """Map a public runner mode to the internal model/dataset modality mode."""
+    normalized = str(run_mode).strip().lower()
+    if normalized == "tabular_only":
+        return "tabular_only"
+    if normalized == "image_only":
+        return "image_only"
+    if normalized in {"fusion", "progressive", "end_to_end"}:
+        return "both"
+    allowed = ", ".join(sorted(VALID_RUN_MODES))
+    raise ValueError(f"run_mode must be one of: {allowed}")
 
 
 def _first_existing(candidates: list[Path]) -> Optional[Path]:
@@ -453,6 +512,7 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
     if normalized == "smoke":
         return MidFusionLiteConfig(
             preset_name="smoke",
+            run_mode="end_to_end",
             n_splits=2,
             fold_indices=[0],
             image_size=64,
@@ -470,6 +530,7 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
         num, cat = build_ablation_columns(True, True, True, True)
         return MidFusionLiteConfig(
             preset_name="kaggle_top1_fusion",
+            run_mode="progressive",
             numeric_cols=num,
             categorical_cols=cat,
             n_splits=5,
@@ -498,7 +559,6 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             download_pretrained_backbone=False,
             max_train_steps_per_epoch=None,
             max_valid_steps=None,
-            use_staged_pretraining=True,
             stage1_epochs=5,
             stage2_epochs=5,
             stage2_train_backbone=False,
@@ -510,6 +570,7 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
     if normalized == "full_lite":
         return MidFusionLiteConfig(
             preset_name="full_lite",
+            run_mode="progressive",
             n_splits=5,
             fold_indices=None,
             image_size=192,
@@ -535,7 +596,6 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             download_pretrained_backbone=False,
             max_train_steps_per_epoch=None,
             max_valid_steps=None,
-            use_staged_pretraining=True,
             stage1_epochs=5,
             stage2_epochs=5,
             stage2_train_backbone=False,  # Freeze backbone in Stage 2 (pretrained weights only)
@@ -547,18 +607,24 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
     if normalized == "image_only_train":
         return MidFusionLiteConfig(
             preset_name="image_only_train",
+            run_mode="image_only",
             n_splits=5,
             image_size=224,
             backbone_name="efficientnet_b0",
-            modality_mode="image_only",
+            stage2_epochs=6,
+            stage2_train_backbone=False,
             output_dir="./mid_fusion_lite_outputs/image_only_train",
         )
 
     if normalized != "quick":
-        raise ValueError("Preset must be one of: smoke, quick, full_lite, image_only_train")
+        raise ValueError(
+            "Preset must be one of: smoke, quick, kaggle_top1_fusion, "
+            "full_lite, image_only_train"
+        )
 
     return MidFusionLiteConfig(
         preset_name="quick",
+        run_mode="end_to_end",
         n_splits=3,
         fold_indices=None,
         image_size=160,

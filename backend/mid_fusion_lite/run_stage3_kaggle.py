@@ -135,13 +135,12 @@ def setup_and_run_fusion():
         fusion_hidden_dim=256,
         fusion_dropout=0.25,
         cross_attention_heads=4,
-        # --- D. ĐIỀU HƯỚNG HUẤN LUYỆN (Chạy End-to-End trực tiếp) ---
-        use_staged_pretraining=False,
-        stage_to_run="all",
-        # Đặt thành None để train toàn bộ trọng số (Tabular + Image + Fusion) từ đầu
-        pretrained_tabular_dir=None,
-        pretrained_image_dir=None,
-        epochs=8,  # Số epoch tổng cộng để train End-to-End
+        # 85% both, 7.5% image-only, 7.5% tabular-only during fusion training.
+        modality_dropout_prob=0.15,
+        # --- D. CHỈ CHẠY FUSION TỪ HAI CHECKPOINT ĐỘC LẬP ---
+        run_mode="fusion",
+        pretrained_tabular_dir=tabm_weights,
+        pretrained_image_dir=image_weights_dir,
         # Tắt auxiliary losses để chỉ tính loss duy nhất sau Fusion
         aux_loss_image_weight=0.0,
         aux_loss_tab_weight=0.0,
