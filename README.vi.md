@@ -7,7 +7,7 @@
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-[English](README.md) | **Tiếng Việt**
+[English](README.md) | **Tiếng Việt** · 📄 [**Báo cáo ĐATN (PDF)**](docs/Bao_Cao_DATN_22280047_22280085.pdf) · 🖥️ [**Slide Bảo vệ (PDF)**](docs/Skin_Cancer_Diagnostic_System_Slides.pdf)
 
 Hệ thống sàng lọc tổn thương da ác tính hoàn chỉnh, xây dựng cho cuộc thi **ISIC 2024 Skin Cancer Detection** (bộ dữ liệu SLICE-3D, ảnh cắt từ chụp toàn thân 3D). Mô hình kết hợp **ảnh tổn thương** với **thông tin lâm sàng (metadata)** qua mạng mid-fusion dùng cross-attention, phục vụ ensemble 5 fold bằng **FastAPI**, và giải thích dự đoán bằng **Grad-CAM** trên giao diện **React**.
 
@@ -142,6 +142,7 @@ python -m pytest
 │   ├── models/                 # Checkpoint fusion (tải về) + metrics.json
 │   └── backbone_image/         # Checkpoint chỉ ảnh (tải về) + metrics.json
 ├── frontend/                   # Giao diện React + TypeScript + Tailwind
+├── docs/                       # Báo cáo Khoá luận Tốt nghiệp & Slide thuyết trình (PDF)
 ├── scripts/check_weights.py    # Kiểm tra trọng số
 ├── Dockerfile, docker-compose.yml
 └── requirements.txt
@@ -151,6 +152,12 @@ python -m pytest
 `backend/mid_fusion_lite/` giữ nguyên **toàn bộ lịch sử commit** từ repo nghiên cứu gốc (`ISIS_2024_demo`, 04–06/2026) trực tiếp trên từng file mã nguồn: thí nghiệm fusion (Cross-Attention, GMU), feature engineering, huấn luyện 3 giai đoạn, tìm siêu tham số Optuna (`Notebook/experiments/`) và notebook huấn luyện trên Kaggle (`Notebook/`). Trọng số đã được loại khỏi lịch sử Git và lưu trên Kaggle.
 
 ---
+
+## 🎓 Thông tin Đồ án & Tác giả
+- **Đồ án Tốt nghiệp Cử nhân ngành Khoa học Dữ liệu** — Khoa Toán – Tin học, **Trường Đại học Khoa học Tự nhiên, ĐHQG-HCM** (2026).
+- **Sinh viên thực hiện:** Nguyễn Lê Đăng Khoa & Phan Gia Thiên
+- **Giảng viên hướng dẫn:** TS. Huỳnh Thế Đăng
+- **Tài liệu:** [Báo cáo Đồ án Tốt nghiệp (PDF)](docs/Bao_Cao_DATN_22280047_22280085.pdf) · [Slide thuyết trình (PDF)](docs/Skin_Cancer_Diagnostic_System_Slides.pdf)
 
 ## 🙏 Ghi nhận
 - [ISIC 2024 Challenge](https://www.kaggle.com/competitions/isic-2024-challenge) và bộ dữ liệu SLICE-3D.

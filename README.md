@@ -7,7 +7,7 @@
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-**English** | [Tiếng Việt](README.vi.md)
+**English** | [Tiếng Việt](README.vi.md) · 📄 [**Thesis Report (PDF, VI)**](docs/Bao_Cao_DATN_22280047_22280085.pdf) · 🖥️ [**Presentation Slides (PDF)**](docs/Skin_Cancer_Diagnostic_System_Slides.pdf)
 
 An end-to-end skin lesion malignancy screening system built for the **ISIC 2024 Skin Cancer Detection** challenge (SLICE-3D, 3D total-body photography crops). It fuses **lesion images** with **patient/lesion metadata** through a cross-attention mid-fusion network, serves a 5-fold ensemble via **FastAPI**, and explains predictions with **Grad-CAM** in a **React** web app.
 
@@ -142,6 +142,7 @@ python -m pytest
 │   ├── models/                 # Fusion checkpoints (downloaded) + metrics.json
 │   └── backbone_image/         # Image-only checkpoints (downloaded) + metrics.json
 ├── frontend/                   # React + TypeScript + Tailwind UI
+├── docs/                       # B.Sc. Thesis Report & Defense Slides (PDF)
 ├── scripts/check_weights.py    # Weight verification
 ├── Dockerfile, docker-compose.yml
 └── requirements.txt
@@ -151,6 +152,12 @@ python -m pytest
 `backend/mid_fusion_lite/` preserves the **full commit history** from the original research repository (`ISIS_2024_demo`, Apr–Jun 2026) directly on the module files: cross-attention & GMU fusion experiments, tabular feature engineering, 3-stage progressive training, Optuna tuning (`Notebook/experiments/`) and Kaggle training notebooks (`Notebook/`). Model weights were stripped from Git history and are hosted on Kaggle.
 
 ---
+
+## 🎓 Academic Context & Authors
+- **B.Sc. Graduation Thesis in Data Science** — Faculty of Mathematics and Computer Science, **University of Science, VNU-HCM** (2026).
+- **Authors:** Nguyễn Lê Đăng Khoa & Phan Gia Thiên
+- **Advisor:** Dr. Huỳnh Thế Đăng
+- **Documents:** [Full Thesis Report (Vietnamese PDF)](docs/Bao_Cao_DATN_22280047_22280085.pdf) · [Defense Presentation Slides (PDF)](docs/Skin_Cancer_Diagnostic_System_Slides.pdf)
 
 ## 🙏 Acknowledgements
 - [ISIC 2024 Challenge](https://www.kaggle.com/competitions/isic-2024-challenge) and the SLICE-3D dataset.

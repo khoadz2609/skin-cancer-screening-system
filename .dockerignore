@@ -11,3 +11,4 @@ backend/static/uploads
 backend/static/session_images
 **/*.csv
 **/*.ipynb
+docs
