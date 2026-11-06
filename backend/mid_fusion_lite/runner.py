@@ -627,7 +627,7 @@ def _run_stage3_fusion(
     best_img_state: Optional[dict[str, torch.Tensor]],
     cat_cardinalities: Optional[list[int]] = None,
 ) -> tuple[dict[str, torch.Tensor], list[dict[str, float]], float]:
-    print(f"\n[Stage 3] Fusion & Fine-Tuning...")
+    print("\n[Stage 3] Fusion & Fine-Tuning...")
     init_bias = -float(np.log(max(1.0, float(config.negative_ratio))))
     model = MidFusionLiteModel(
         **_model_kwargs_for_mode(
@@ -804,7 +804,7 @@ def _run_staged_pretraining_for_fold(
         if run_mode == "fusion"
         else "3-STAGE PROGRESSIVE TRAINING"
     )
-    print(f"\n" + "=" * 80)
+    print("\n" + "=" * 80)
     print(f"  >>> RUNNING {training_title} FOR FOLD {fold_index + 1} <<<")
     print("=" * 80)
 

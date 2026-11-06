@@ -5,7 +5,6 @@ import uuid
 import json
 import time
 from datetime import datetime
-import pickle
 import zipfile
 import h5py
 import pandas as pd
@@ -14,19 +13,17 @@ import torch
 from io import BytesIO
 from pathlib import Path
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from torch.utils.data import DataLoader
 
 # Add current directory to path to import BEST_WITH_CONCAT modules
 sys.path.append(str(Path(__file__).parent))
 
-from mid_fusion_lite.config import MidFusionLiteConfig, get_preset_config, BASE_NUMERIC_COLS
+from mid_fusion_lite.config import get_preset_config
 from mid_fusion_lite.tabular_engineering_02 import add_feature_engineering
-from mid_fusion_lite.tabular_preprocessor_04 import FoldTabularPreprocessor, select_available_columns
 from mid_fusion_lite.data import get_image_transforms
 from mid_fusion_lite.model import MidFusionLiteModel
 from mid_fusion_lite.train import predict_loader
@@ -87,13 +84,11 @@ app.add_middleware(
 # Directory configuration
 BASE_DIR = Path(__file__).parent
 STATIC_DIR = BASE_DIR / "static"
-TEMPLATES_DIR = BASE_DIR / "templates"
 UPLOADS_DIR = STATIC_DIR / "uploads"
 SESSION_IMAGES_DIR = STATIC_DIR / "session_images"
 
 # Ensure directories exist
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
-TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 

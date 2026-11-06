@@ -1,9 +1,7 @@
 import os
 
 import pandas as pd
-import numpy as np
 import h5py
-import os
 
 def create_demo_dataset():
     # Đường dẫn chuẩn trên Kaggle (Đã bao gồm file chứa cột fold)
@@ -53,7 +51,7 @@ def create_demo_dataset():
     selected_patient = patient_image_counts_diff.idxmin()
     exact_count = patient_image_counts[selected_patient]
     
-    print(f"4. Đã TÌM ĐƯỢC 1 Bệnh nhân thỏa mãn:")
+    print("4. Đã TÌM ĐƯỢC 1 Bệnh nhân thỏa mãn:")
     print(f"   -> ID: {selected_patient}")
     print(f"   -> Tổng số ảnh: {exact_count}")
     print(f"   -> Số ảnh có bệnh (target=1): {df_val[(df_val['patient_id'] == selected_patient) & (df_val['target'] == 1)].shape[0]}")
@@ -68,7 +66,7 @@ def create_demo_dataset():
     # --- TRÍCH XUẤT ẢNH TỪ HDF5 KHỔNG LỒ SANG HDF5 MINI ---
     isic_ids_to_extract = demo_df['isic_id'].tolist()
     
-    print(f"5. Đang trích xuất ảnh từ file HDF5 gốc sang HDF5 mini...")
+    print("5. Đang trích xuất ảnh từ file HDF5 gốc sang HDF5 mini...")
     try:
         with h5py.File(input_h5, 'r') as h5_in:
             with h5py.File(output_h5, 'w') as h5_out:

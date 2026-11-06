@@ -181,7 +181,6 @@ class FoldTabularPreprocessor:
                 col: float(numeric_frame[col].median())
                 for col in self.active_numeric_cols
             }
-            numeric_filled = numeric_frame.fillna(self.numeric_medians)
 
         # Number of numeric columns after optional null-importance filtering. Used by
         # callers to compute PLE bins on the numeric block only (codes come after).

@@ -1,4 +1,3 @@
-import os
 import sys
 import pickle
 import pandas as pd
@@ -8,7 +7,7 @@ from pathlib import Path
 # Add current directory to path to import BEST_WITH_CONCAT
 sys.path.append(str(Path(__file__).parent))
 
-from mid_fusion_lite.config import MidFusionLiteConfig, get_preset_config, BASE_NUMERIC_COLS
+from mid_fusion_lite.config import get_preset_config, BASE_NUMERIC_COLS
 from mid_fusion_lite.tabular_engineering_02 import add_feature_engineering
 from mid_fusion_lite.tabular_preprocessor_04 import FoldTabularPreprocessor, select_available_columns
 from sklearn.model_selection import StratifiedGroupKFold

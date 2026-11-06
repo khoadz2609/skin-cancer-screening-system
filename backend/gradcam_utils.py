@@ -15,7 +15,7 @@ class GradCAM:
         
         # Đăng ký hook thu thập đặc trưng và đạo hàm
         self.handlers.append(self.target_layer.register_forward_hook(self._save_features))
-        self.handlers.append(self.target_layer.register_backward_hook(self._save_gradients))
+        self.handlers.append(self.target_layer.register_full_backward_hook(self._save_gradients))
 
     def _save_features(self, module, input, output):
         self.features = output.detach()

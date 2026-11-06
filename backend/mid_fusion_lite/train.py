@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from contextlib import nullcontext
 from typing import Any, Callable, Optional
 

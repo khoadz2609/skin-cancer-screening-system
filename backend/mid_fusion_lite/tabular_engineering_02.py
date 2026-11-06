@@ -51,7 +51,6 @@ def _add_ugly_duckling_features(
     if loc_col is None:
         return
 
-    patient_grouped = out.groupby(group_col, observed=False, sort=False)
     loc_grouped = out.groupby([group_col, loc_col], observed=False, sort=False)
 
     ud_loc_cols: list[str] = []
