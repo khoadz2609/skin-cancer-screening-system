@@ -43,3 +43,13 @@ frontend/.env.production.local
 *.swp
 .DS_Store
 Thumbs.db
+
+# Training artifacts (hosted on Kaggle)
+backend/**/oof_predictions.csv
+backend/**/submission_*.csv
+
+# Build artifacts
+*.tsbuildinfo
+/package-lock.json
+.ruff_cache/
+
