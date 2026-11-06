@@ -5,7 +5,7 @@ import { toast } from 'sonner';
 import { predictBatch, getModels } from '../../api/predictionApi';
 import type { BatchPredictionResponse, BatchPredictionItem } from '../../types/api';
 import { env } from '../../config/env';
-import { riskBadgeClass } from '../../lib/risk';
+import { HIGH_RISK_THRESHOLD, SCREENING_THRESHOLD, riskBadgeClass } from '../../lib/risk';
 
 export function PredictionPage() {
   const [csvFile, setCsvFile] = useState<File | null>(null);
@@ -93,8 +93,8 @@ export function PredictionPage() {
   };
 
   const getRiskColor = (prob: number) => {
-    if (prob >= 0.5) return 'text-red-600 bg-red-50';
-    if (prob >= 0.17) return 'text-amber-600 bg-amber-50';
+    if (prob >= HIGH_RISK_THRESHOLD) return 'text-red-600 bg-red-50';
+    if (prob >= SCREENING_THRESHOLD) return 'text-amber-600 bg-amber-50';
     return 'text-emerald-600 bg-emerald-50';
   };
 

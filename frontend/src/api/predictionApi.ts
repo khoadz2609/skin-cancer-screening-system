@@ -1,5 +1,5 @@
 import { env } from '../config/env';
-import { classifyRisk } from '../lib/risk';
+import { classifyRisk, HIGH_RISK_THRESHOLD, SCREENING_THRESHOLD } from '../lib/risk';
 import type {
   BatchPredictionResponse,
   HealthResponse,
@@ -64,8 +64,8 @@ export async function getHealth(): Promise<HealthResponse> {
       model_ready: true,
       model_version: 'mock-model',
       threshold: {
-        screening_threshold: 0.1791,
-        high_risk_threshold: 0.5,
+        screening_threshold: SCREENING_THRESHOLD,
+        high_risk_threshold: HIGH_RISK_THRESHOLD,
         target_recall: 0.95
       }
     };
@@ -85,15 +85,15 @@ export async function predictSkinCancer(input: {
   if (env.enableMock) {
     await new Promise((resolve) => setTimeout(resolve, 700));
     const probability = mockProbability(input.metadata);
-    const risk = classifyRisk(probability, 0.1791, 0.5);
+    const risk = classifyRisk(probability, SCREENING_THRESHOLD, HIGH_RISK_THRESHOLD);
 
     return {
       prediction_id: `mock_${Date.now()}`,
       model_version: 'mock-ui-model',
       mode: 'mock',
       probability_malignant: probability,
-      screening_threshold: 0.1791,
-      high_risk_threshold: 0.5,
+       screening_threshold: SCREENING_THRESHOLD,
+       high_risk_threshold: HIGH_RISK_THRESHOLD,
       ...risk,
       recommendation:
         risk.risk_level === 'low'
