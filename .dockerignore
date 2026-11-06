@@ -1,0 +1,13 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+**/node_modules
+frontend/dist
+backend/models/*.pt
+backend/backbone_image/*.pt
+backend/preprocessor_cache
+backend/static/uploads
+backend/static/session_images
+**/*.csv
+**/*.ipynb

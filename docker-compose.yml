@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    image: skin-cancer-screening
+    ports:
+      - "8000:8000"
+    environment:
+      CORS_ALLOW_ORIGINS: "http://localhost:8000,http://127.0.0.1:8000"
+    volumes:
+      # Weights are downloaded from Kaggle on the host (see README) and mounted read-only.
+      - ./backend/models:/app/backend/models:ro
+      - ./backend/backbone_image:/app/backend/backbone_image:ro
+      # Fitted tabular preprocessors are cached here on first run.
+      - ./backend/preprocessor_cache:/app/backend/preprocessor_cache

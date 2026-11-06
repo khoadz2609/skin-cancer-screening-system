@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+testpaths = ["backend/tests", "backend/mid_fusion_lite/tests"]
+pythonpath = [".", "backend"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = ["**/*.ipynb"]
+
+[tool.ruff.lint]
+# Correctness-focused rule set: pyflakes + pycodestyle errors.
+select = ["E9", "F"]
