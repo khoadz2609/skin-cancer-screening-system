@@ -71,7 +71,7 @@ http://localhost:5173
 Sửa file `.env`:
 
 ```env
-VITE_API_BASE_URL=http://localhost:8000/api/v1
+VITE_API_BASE_URL=http://localhost:8000
 VITE_ENABLE_MOCK=false
 ```
 

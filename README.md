@@ -112,3 +112,23 @@ Script này sẽ tự động khởi tạo backend FastAPI (cổng `8000`) và f
    * Chọn **Mô hình kết hợp** để tải lên cả file metadata (CSV) và ảnh lâm sàng.
    * Chọn **Mô hình chỉ dùng ảnh** để chỉ cần kéo thả hình ảnh tổn thương da đơn lẻ mà không cần bất kỳ thông tin nào khác.
 3. Bấm **Tiến hành Sàng lọc** để nhận tỉ lệ ác tính, mức độ cảnh báo và bản đồ nhiệt giải thích vị trí tổn thương da.
+
+## Download and verify model artifacts
+
+The checkpoints are intentionally kept outside Git because of their size. With the Kaggle CLI authenticated, download the two public datasets into the expected folders:
+
+```bash
+kaggle datasets download -d khoangdz/fusion-backbone -p backend/models --unzip
+kaggle datasets download -d khoangdz/isic-2024-effb0-backbone -p backend/backbone_image --unzip
+```
+
+Verify the local files before starting the API:
+
+```bash
+python scripts/check_weights.py
+python scripts/check_weights.py --require-preprocessors
+```
+
+The verifier checks all five folds, `metrics.json`, and (optionally) the cached fusion preprocessors. Checkpoints and caches are intentionally ignored by Git; the Kaggle datasets above are the official download sources for this demo.
+
+Install the CLI if needed with `pip install kaggle`, then configure `~/.kaggle/kaggle.json` using your Kaggle account credentials.

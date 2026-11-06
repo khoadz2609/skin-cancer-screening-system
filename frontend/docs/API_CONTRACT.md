@@ -1,417 +1,116 @@
-# API Contract – ISIC Skin Cancer Demo
+﻿# API contract hiện tại
 
-Repo frontend chỉ phụ trách UI/UX và gọi API. Backend, database và model inference triển khai riêng.
-
-Base URL:
+Frontend trong repo này gọi trực tiếp backend FastAPI tại:
 
 ```text
-http://localhost:8000/api/v1
+http://localhost:8000
 ```
 
-Frontend đọc từ:
+Đặt trong `.env`:
 
 ```env
-VITE_API_BASE_URL=http://localhost:8000/api/v1
+VITE_API_BASE_URL=http://localhost:8000
+VITE_ENABLE_MOCK=false
 ```
 
----
+## Health check
 
-## 1. Luồng UX đã chốt
-
-Giao diện Predict có 2 vùng chính:
-
-```text
-Bên trái:
-- Một ô upload duy nhất cho metadata JSON hoặc ảnh QR
-- Hiển thị thông tin bệnh nhân read-only
-- Hiển thị metadata ảnh read-only
-
-Bên phải:
-- Một ô upload ảnh tổn thương hoặc file HDF5
-- Khi chưa upload: ô hiển thị nút upload
-- Khi đã upload: chính ô đó hiển thị tên file + nút X
-- Nếu là ảnh thông dụng: preview ảnh trong khung cố định
-- Nếu là HDF5: chỉ hiển thị tên file, không preview
-- Nút prediction và kết quả nằm cùng một hàng
-```
-
-Bác sĩ không nhập tay hồ sơ bệnh nhân hoặc metadata quan trọng để tránh sai lệch dữ liệu.
-
----
-
-## 2. Upload metadata JSON/QR
-
-Frontend dùng cùng một ô upload cho metadata JSON hoặc ảnh QR:
-
-```text
-.json
-.png
-.jpg
-.jpeg
-```
-
-Nguyên tắc chung:
-
-```text
-Thiết bị/hệ thống quang học xuất metadata JSON hoặc QR
-→ frontend upload file lên backend
-→ backend resolve patient/metadata
-→ frontend chỉ hiển thị dữ liệu read-only
-```
-
-Frontend không tự fill thông tin bệnh nhân từ JSON để tránh sai lệch dữ liệu.
-
-Nếu là `.json`, frontend gọi:
-
-```text
-POST /metadata/json/resolve
-```
-
-Nếu là ảnh QR, frontend gọi:
-
-```text
-POST /metadata/qr/decode
-```
-
-Backend xử lý JSON/QR, tra cứu hoặc lưu thông tin bệnh nhân trong DB, chuẩn hóa metadata và trả dữ liệu về frontend.
-
----
-
-## 3. Metadata JSON resolve
-
-### `POST /metadata/json/resolve`
-
-Content-Type:
-
-```text
-multipart/form-data
-```
-
-### Request fields
-
-| Field           | Type | Required | Mô tả                                            |
-| --------------- | ---: | -------: | ------------------------------------------------ |
-| `metadata_file` | File |      Yes | File `.json` xuất từ thiết bị/hệ thống quang học |
-
-### JSON metadata mẫu
-
-Metadata demo dựa trên file `test-metadata.csv`.
-
-```json
-{
-  "metadata_mode": "processed",
-  "source": "optical_device",
-  "patient_code": "IP_6074337",
-  "isic_id": "ISIC_0015657",
-  "metadata": {
-    "isic_id": "ISIC_0015657",
-    "patient_id": "IP_6074337",
-    "age_approx": 45,
-    "sex": "male",
-    "anatom_site_general": "posterior torso",
-    "clin_size_long_diam_mm": 2.7,
-    "image_type": "TBP tile: close-up",
-    "tbp_tile_type": "3D: XP",
-    "tbp_lv_areaMM2": 3.846876,
-    "tbp_lv_perimeterMM": 9.387248,
-    "tbp_lv_location": "Torso Back Top Third",
-    "tbp_lv_location_simple": "Torso Back",
-    "attribution": "Memorial Sloan Kettering Cancer Center",
-    "copyright_license": "CC-BY"
-  }
-}
-```
-
-### Response
-
-```json
-{
-  "payload": {
-    "metadata_mode": "processed",
-    "source": "optical_device",
-    "patient_code": "IP_6074337",
-    "isic_id": "ISIC_0015657"
-  },
-  "patient": {
-    "patient_code": "IP_6074337",
-    "patient_name": "Demo Patient 6074337",
-    "contact": "0900000000",
-    "note": "Demo patient loaded from backend DB"
-  },
-  "resolved_metadata": {
-    "metadata_mode": "processed",
-    "source": "optical_device",
-    "isic_id": "ISIC_0015657",
-    "patient_id": "IP_6074337",
-    "age_approx": 45,
-    "sex": "male",
-    "anatom_site_general": "posterior torso",
-    "clin_size_long_diam_mm": 2.7,
-    "image_type": "TBP tile: close-up",
-    "tbp_tile_type": "3D: XP",
-    "tbp_lv_areaMM2": 3.846876,
-    "tbp_lv_perimeterMM": 9.387248,
-    "tbp_lv_location": "Torso Back Top Third",
-    "tbp_lv_location_simple": "Torso Back",
-    "attribution": "Memorial Sloan Kettering Cancer Center",
-    "copyright_license": "CC-BY"
-  }
-}
-```
-
-Backend là nơi quyết định thông tin bệnh nhân cuối cùng. Frontend chỉ nhận response và hiển thị read-only.
-
----
-
-## 4. QR metadata
-
-QR không được tạo thủ công trên frontend. Thiết bị/hệ thống quang học sẽ sinh QR.
-
-QR nên chứa mã tham chiếu hoặc thông tin định danh ngắn, không nên chứa full metadata quá dài.
-
-### Payload QR khuyến nghị
-
-```json
-{
-  "metadata_mode": "lookup",
-  "source": "device_or_hospital_system",
-  "patient_code": "IP_6074337",
-  "isic_id": "ISIC_0015657",
-  "metadata_ref": "META_ISIC_0015657"
-}
-```
-
-Backend decode QR, sau đó tra cứu hoặc chuẩn hóa metadata và trả về cùng format với JSON resolve.
-
----
-
-## 5. Health Check
-
-### `GET /health`
-
-### Response
+`GET /health`
 
 ```json
 {
   "status": "ok",
-  "service": "isic-skin-backend",
+  "service": "fastapi-backend",
   "model_ready": true,
-  "model_version": "mobilenetv3-fusion-v1",
-  "threshold": {
-    "screening_threshold": 0.1791,
-    "high_risk_threshold": 0.5,
-    "target_recall": 0.95
-  }
+  "model_version": "mid_fusion_lite"
 }
 ```
 
----
+`model_ready` chỉ là `true` khi backend tìm thấy checkpoint `.pt` trong
+`backend/models` hoặc `backend/backbone_image`.
 
-## 6. Prediction
+## Danh sách model
 
-### `POST /predictions`
+`GET /api/models`
 
-Content-Type:
-
-```text
-multipart/form-data
-```
-
-### Request fields
-
-| Field           |        Type | Required | Mô tả                                                                                                                |
-| --------------- | ----------: | -------: | -------------------------------------------------------------------------------------------------------------------- |
-| `image`         |        File |      Yes | Ảnh hoặc file test model. Hỗ trợ `.jpg`, `.jpeg`, `.png`, `.webp`, `.h5`, `.hdf5`. File gốc, không resize ở frontend |
-| `patient`       | JSON string |       No | Thông tin bệnh nhân do backend resolve từ metadata/DB                                                                |
-| `metadata`      | JSON string |      Yes | Metadata đã được backend resolve từ JSON/QR                                                                          |
-| `metadata_mode` |      string |       No | `raw`, `processed`, `lookup`                                                                                         |
-| `source`        |      string |       No | `json`, `qr`, `lookup`                                                                                               |
-
-Nếu file là `.h5` hoặc `.hdf5`, frontend không preview ảnh. Backend/model tự xử lý nội dung HDF5.
-
-### Response
+Trả về các thư mục model có checkpoint, ví dụ:
 
 ```json
 {
-  "prediction_id": "pred_20260627_001",
-  "model_version": "mobilenetv3-fusion-v1",
-  "mode": "real_model",
-  "probability_malignant": 0.8872,
-  "screening_threshold": 0.1791,
-  "high_risk_threshold": 0.5,
-  "risk_level": "high",
-  "risk_text": "Nguy cơ cao / cần kiểm tra thêm",
-  "recommendation": "Nên được bác sĩ/chuyên gia kiểm tra thêm.",
-  "metrics_context": {
-    "holdout_auc": 0.9163,
-    "holdout_average_precision": 0.7551,
-    "holdout_recall_at_screening_threshold": 0.9667,
-    "holdout_precision_at_screening_threshold": 0.2843,
-    "holdout_false_negative": 1,
-    "holdout_false_positive": 73
-  },
-  "metadata_used": {
-    "isic_id": "ISIC_0015657",
-    "metadata_mode": "processed"
-  },
-  "patient": {
-    "patient_code": "IP_6074337",
-    "patient_name": "Demo Patient 6074337",
-    "contact": "0900000000"
-  },
-  "created_at": "2026-06-27T10:30:00Z"
+  "models": [
+    {
+      "folder_name": "models",
+      "preset_name": "kaggle_top1_fusion",
+      "checkpoints": ["mid_fusion_lite_fold_0.pt"],
+      "cv_pauc": 0.1753
+    }
+  ]
 }
 ```
 
----
+## Dự đoán hàng loạt
 
-## 7. QR decode
+`POST /api/predict` với `multipart/form-data`.
 
-### `POST /metadata/qr/decode`
+| Field | Bắt buộc | Mô tả |
+|---|---:|---|
+| `model_folder` | Có | Tên thư mục model do `/api/models` trả về. Không truyền đường dẫn tuyệt đối. |
+| `csv_file` | Fusion | CSV phải có cột `isic_id`; nên có `patient_id` và metadata tương ứng. |
+| `image_files` | Một trong các field ảnh | Một hoặc nhiều ảnh `.jpg`, `.jpeg`, `.png`, `.webp`. |
+| `zip_file` | Một trong các field ảnh | ZIP chứa các file ảnh. Đường dẫn con bị làm phẳng và chỉ nhận file ảnh. |
+| `hdf5_file` | Một trong các field ảnh | HDF5 chứa dataset ảnh theo `isic_id`. |
 
-Content-Type:
+Giới hạn hiện tại: mỗi file tối đa 100 MB, tổng nội dung giải nén ZIP tối đa
+250 MB.
 
-```text
-multipart/form-data
-```
-
-### Request fields
-
-| Field      | Type | Required | Mô tả                                         |
-| ---------- | ---: | -------: | --------------------------------------------- |
-| `qr_image` | File |      Yes | Ảnh QR do thiết bị/hệ thống quang học xuất ra |
-
-### Response
+Response thành công:
 
 ```json
 {
-  "payload": {
-    "metadata_mode": "lookup",
-    "source": "device_or_hospital_system",
-    "patient_code": "IP_6074337",
-    "isic_id": "ISIC_0015657",
-    "metadata_ref": "META_ISIC_0015657"
-  },
-  "patient": {
-    "patient_code": "IP_6074337",
-    "patient_name": "Demo Patient 6074337",
-    "contact": "0900000000",
-    "note": "Demo patient loaded from backend DB"
-  },
-  "resolved_metadata": {
-    "metadata_mode": "processed",
-    "source": "optical_device",
-    "isic_id": "ISIC_0015657",
-    "patient_id": "IP_6074337",
-    "age_approx": 45,
-    "sex": "male",
-    "anatom_site_general": "posterior torso",
-    "clin_size_long_diam_mm": 2.7
-  }
+  "status": "success",
+  "session_id": "uuid",
+  "results": [
+    {
+      "isic_id": "ISIC_0015657",
+      "probability_raw": 0.42,
+      "probability_processed": 0.42,
+      "risk_level": "medium",
+      "risk_text": "...",
+      "image_url": "/static/session_images/<uuid>/ISIC_0015657.jpg",
+      "cam_image_url": "/static/session_images/<uuid>/ISIC_0015657_cam.jpg"
+    }
+  ]
 }
 ```
 
----
+Preview và Grad-CAM trong `static/session_images` được tự động xóa sau 7 ngày.
 
-## 8. Patient lookup
+Ngưỡng rủi ro dùng chung:
 
-### `GET /patients/{patient_code}`
+- `low`: dưới `0.395996`
+- `medium`: từ `0.395996` đến dưới `0.560058`
+- `high`: từ `0.560058`
 
-Endpoint này dùng khi cần tra cứu thông tin bệnh nhân theo mã.
+## Khởi tạo preprocessor
 
-Trong flow chính, frontend không bắt buộc gọi endpoint này trực tiếp vì backend đã trả `patient` trong response của `/metadata/json/resolve` hoặc `/metadata/qr/decode`.
+`POST /api/initialize`
 
-### Response
+Form fields:
 
-```json
-{
-  "patient_code": "IP_6074337",
-  "patient_name": "Demo Patient 6074337",
-  "contact": "0900000000",
-  "note": "Demo patient loaded from backend DB"
-}
-```
+- `preset_name`: `smoke`, `quick` hoặc `full_lite`
+- `n_splits`: số fold tương ứng
 
----
+## Lịch sử dự đoán
 
-## 9. Metadata lookup
+`GET /predictions`
 
-### `GET /metadata/{isic_id}?mode=processed`
+Trả về tối đa 1.000 kết quả gần nhất trong bộ nhớ tiến trình. Dữ liệu này
+không phải database bền vững và sẽ mất khi backend khởi động lại.
 
-Hoặc lookup bằng `metadata_ref`:
+## Phạm vi hiện tại
 
-### `GET /metadata/by-ref/{metadata_ref}`
+Các endpoint metadata JSON/QR và `POST /predictions` được mô tả trong các bản
+contract cũ chưa được backend hiện tại triển khai. Flow đang chạy của frontend
+là upload CSV + ảnh/HDF5/ZIP qua `POST /api/predict`.
 
-Trong flow chính, frontend không bắt buộc gọi endpoint này trực tiếp vì backend đã trả `resolved_metadata` trong response của `/metadata/json/resolve` hoặc `/metadata/qr/decode`.
-
-### Response
-
-```json
-{
-  "isic_id": "ISIC_0015657",
-  "mode": "processed",
-  "patient": {
-    "patient_code": "IP_6074337",
-    "patient_name": "Demo Patient 6074337",
-    "contact": "0900000000"
-  },
-  "metadata": {
-    "metadata_mode": "processed",
-    "source": "optical_device",
-    "isic_id": "ISIC_0015657",
-    "patient_id": "IP_6074337",
-    "age_approx": 45,
-    "sex": "male",
-    "anatom_site_general": "posterior torso",
-    "clin_size_long_diam_mm": 2.7
-  }
-}
-```
-
----
-
-## 10. Error response
-
-Backend nên trả lỗi theo format thống nhất:
-
-```json
-{
-  "detail": "Invalid metadata JSON file"
-}
-```
-
-Các mã lỗi tối thiểu:
-
-| Status | Trường hợp                                                   |
-| -----: | ------------------------------------------------------------ |
-|  `400` | File không hợp lệ, sai định dạng, JSON parse lỗi             |
-|  `404` | Không tìm thấy `patient_code`, `isic_id` hoặc `metadata_ref` |
-|  `422` | Input không đủ điều kiện để model inference                  |
-|  `500` | Lỗi backend/model inference                                  |
-
----
-
-## 11. Không dùng các cột leakage
-
-Backend không được dùng các cột sau trong inference:
-
-```text
-target
-iddx_full
-iddx_1
-iddx_2
-iddx_3
-iddx_4
-iddx_5
-mel_mitotic_index
-mel_thick_mm
-tbp_lv_dnn_lesion_confidence
-```
-
-Các cột này chỉ dùng cho phân tích dữ liệu hoặc đánh giá offline, không đưa vào input model khi inference.
-
----
-
-## 12. Disclaimer
-
-Ứng dụng chỉ phục vụ demo học thuật và hỗ trợ sàng lọc. Kết quả model không được dùng như chẩn đoán y khoa cuối cùng.
+Ứng dụng chỉ phục vụ demo học thuật và không thay thế chẩn đoán y khoa.
