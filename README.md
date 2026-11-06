@@ -1,134 +1,160 @@
-# Skin Cancer Screening & Diagnostic System (Web Demo)
+# 🩺 Skin Cancer Screening System — Multimodal Fusion for ISIC 2024
 
-Hệ thống hỗ trợ sàng lọc và dự đoán nguy cơ ung thư da sử dụng trí tuệ nhân tạo đa phương thức (**Multimodal Fusion** và **Vision Only**). Dự án tích hợp mô hình học sâu phân tích hình ảnh tổn thương da lâm sàng và dữ liệu bệnh nhân (metadata) để đưa ra tỉ lệ ác tính và phân cấp rủi ro.
+[![CI](https://github.com/khoadz2609/skin-cancer-screening-system/actions/workflows/ci.yml/badge.svg)](https://github.com/khoadz2609/skin-cancer-screening-system/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
+![License](https://img.shields.io/badge/License-MIT-green)
 
----
+**English** | [Tiếng Việt](README.vi.md)
 
-## 📌 Tổng quan dự án
+An end-to-end skin lesion malignancy screening system built for the **ISIC 2024 Skin Cancer Detection** challenge (SLICE-3D, 3D total-body photography crops). It fuses **lesion images** with **patient/lesion metadata** through a cross-attention mid-fusion network, serves a 5-fold ensemble via **FastAPI**, and explains predictions with **Grad-CAM** in a **React** web app.
 
-Hệ thống cung cấp 2 chế độ dự đoán chính:
-1. **Mô hình Kết hợp (Multimodal Fusion):** Kết hợp cả ảnh chụp lâm sàng da và thông tin metadata của bệnh nhân (tuổi, giới tính, vị trí tổn thương, kích thước...) thông qua kiến trúc **EfficientNet-B0 + TabM (Tabular Encoder)** và cơ chế **Cross-Attention Fusion**.
-2. **Mô hình chỉ dùng ảnh (Vision Only):** Phù hợp khi chỉ nhập ảnh đơn lẻ mà không có thông tin lâm sàng kèm theo. Chế độ này sử dụng Vision Backbone để dự đoán trực tiếp dựa trên đặc trưng hình ảnh.
+> [!CAUTION]
+> This is an academic project (graduation thesis). It is **not a medical device** and must not be used to diagnose or replace a dermatologist.
 
-Hệ thống còn tích hợp bản đồ nhiệt **Grad-CAM (Gradient-weighted Class Activation Mapping)** để giải thích trực quan (Explainable AI) vùng ảnh hưởng mà mô hình chú ý khi đưa ra quyết định.
-
----
-
-## 🛠️ Kiến trúc công nghệ
-
-* **Frontend:** React.js (TypeScript), Vite, TailwindCSS, Lucide Icons.
-* **Backend:** FastAPI (Python), PyTorch, Timm, TabM, Scikit-learn, Pandas, H5Py.
+<!-- TODO: add a demo GIF / screenshots here, e.g. ![Demo](docs/images/demo.gif) -->
 
 ---
 
-## 📂 Cấu trúc thư mục dự án
+## 📊 Results
+
+5-fold cross-validation on ~401k lesions. Metric: **partial AUC above 80% TPR** (official ISIC 2024 metric, maximum = 0.20).
+
+| Model | OOF pAUC | Mean fold pAUC |
+|---|---|---|
+| Image only — EfficientNet-B0 | 0.1463 | 0.1532 |
+| Tabular only — TabM on engineered metadata | 0.1682 | 0.1741 |
+| **Mid-fusion — EfficientNet-B0 + TabM + Cross-Attention** | **0.1754** | **0.1801** |
+
+<details>
+<summary>Per-fold pAUC</summary>
+
+| Fold | Image only | Tabular only | Fusion |
+|---|---|---|---|
+| 0 | 0.1392 | 0.1671 | 0.1708 |
+| 1 | 0.1484 | 0.1763 | 0.1781 |
+| 2 | 0.1736 | 0.1828 | 0.1879 |
+| 3 | 0.1384 | 0.1716 | 0.1766 |
+| 4 | 0.1662 | 0.1728 | 0.1870 |
+
+Sources: [`backend/models/metrics.json`](backend/models/metrics.json), [`backend/backbone_image/metrics.json`](backend/backbone_image/metrics.json), [`tabular-only.ipynb`](backend/mid_fusion_lite/Notebook/tabular-only.ipynb).
+</details>
+
+**Takeaway:** metadata alone is a strong signal, but fusing it with image features gives the best and most consistent result — fusion wins on every fold.
+
+---
+
+## 🏗️ Architecture
+
+### Model
+
+```mermaid
+flowchart LR
+    IMG["Lesion image"] --> CNN["EfficientNet-B0 backbone"]
+    META["Patient and lesion metadata"] --> FE["Feature engineering and selection"]
+    FE --> TABM["TabM encoder"]
+    CNN --> XATTN["Cross-modal attention fusion"]
+    TABM --> XATTN
+    XATTN --> HEAD["MLP head"]
+    HEAD --> P["Malignancy probability"]
+```
+
+### Web application
+
+```mermaid
+flowchart LR
+    UI["React + Vite UI"] -->|"images / ZIP / HDF5 + CSV"| API["FastAPI"]
+    API --> PRE["Tabular preprocessors (per fold)"]
+    PRE --> ENS["5-fold model ensemble"]
+    ENS --> RISK["Risk tiers: screening / high-risk thresholds"]
+    ENS --> CAM["Grad-CAM heatmaps"]
+    RISK --> UI
+    CAM --> UI
+```
+
+### Technical highlights
+- **Multimodal mid-fusion** with cross-attention (a Gated Multimodal Unit variant was also explored), plus **modality dropout** so the model stays robust when one modality is missing.
+- **Progressive 3-stage training:** pretrain each branch → freeze and train fusion → fine-tune end-to-end.
+- **Tabular pipeline:** patient-relative features, anatomical z-scores, LOF outlier scores, feature selection; TabM / TabR hyper-parameters tuned with **Optuna** (with pruning).
+- **Image preprocessing:** Shades of Gray color constancy; patient-wise post-processing on predictions.
+- **Explainable AI:** Grad-CAM overlays computed on the image branch of the fusion model.
+- **Hardened API:** streamed uploads with size limits, ZIP-bomb and path checks, image-type allow-list, configurable CORS, expiring session files.
+
+---
+
+## 🚀 Quick start
+
+### 1. Download model weights
+Weights are hosted on Kaggle (not in Git). With the [Kaggle CLI](https://github.com/Kaggle/kaggle-api) configured:
+
+```bash
+kaggle datasets download -d khoangdz/fusion-backbone          -p backend/models         --unzip
+kaggle datasets download -d khoangdz/isic-2024-effb0-backbone -p backend/backbone_image --unzip
+python scripts/check_weights.py   # verifies all 5 folds + metrics.json
+```
+
+### 2a. Run with Docker
+```bash
+docker compose up --build
+# open http://localhost:8000
+```
+
+### 2b. Run locally
+```bash
+# backend
+python -m venv .venv && .venv/Scripts/activate      # Linux/macOS: source .venv/bin/activate
+pip install -r requirements.txt
+
+# frontend (build is served by FastAPI)
+cd frontend && npm ci && npm run build && cd ..
+
+cd backend && uvicorn main:app --host 127.0.0.1 --port 8000
+```
+On Windows you can also double-click [`start_demo.bat`](start_demo.bat) (backend on `:8000`, Vite dev server on `:5173`).
+
+### 3. Use it
+1. Choose **Fusion model** (images + metadata CSV) or **Image-only model** (images only).
+2. Upload images (files / ZIP / HDF5) — sample metadata is in [`frontend/docs/sample-metadata.json`](frontend/docs/sample-metadata.json).
+3. Get the malignancy probability, risk tier and Grad-CAM heatmap for each lesion.
+
+### Tests
+```bash
+python -m pytest
+```
+
+---
+
+## 📂 Project structure
 
 ```text
-final_web_demo/
-├── backend/                  # Mã nguồn FastAPI Web Backend
-│   ├── backbone_image/       # Chứa các checkpoint mô hình chỉ dùng ảnh (.pt)
-│   ├── models/               # Chứa các checkpoint mô hình kết hợp fusion (.pt)
-│   ├── mid_fusion_lite/      # Module huấn luyện & định nghĩa mô hình (được tối ưu hóa)
-│   ├── static/               # Lưu trữ ảnh tải lên và heatmap Grad-CAM tạm thời
-│   ├── main.py               # API chính phục vụ dự đoán và lấy lịch sử
-│   └── gradcam_utils.py      # Bộ công cụ sinh bản đồ nhiệt Grad-CAM
-├── frontend/                 # Mã nguồn React Frontend
-│   ├── src/
-│   │   ├── api/              # Chứa các hàm giao tiếp http/endpoints
-│   │   ├── features/         # Các trang giao diện (Prediction, History)
-│   │   └── App.tsx           # Thành phần chính điều phối SPA
-│   ├── package.json          # Quản lý thư viện Node.js
-│   └── vite.config.ts        # Cấu hình build Vite
-├── .gitignore                # Ngăn git theo dõi các file nặng/cache
-├── requirements.txt          # Thư viện Python cần cài đặt
-└── start_demo.bat            # Script khởi động nhanh cả Frontend và Backend (Windows)
+.
+├── backend/
+│   ├── main.py                 # FastAPI app: prediction, history, presets
+│   ├── gradcam_utils.py        # Grad-CAM for the fusion model
+│   ├── preprocessor_utils.py   # Per-fold tabular preprocessors
+│   ├── mid_fusion_lite/        # Multimodal model, tabular pipeline, training & notebooks
+│   │   ├── Notebook/           # Main training notebooks (fusion, image-only, tabular-only)
+│   │   │   └── experiments/    # Optuna tuning & ablation study notebooks
+│   │   └── tests/              # Model & modality-dropout unit tests
+│   ├── tests/                  # API & Grad-CAM tests
+│   ├── models/                 # Fusion checkpoints (downloaded) + metrics.json
+│   └── backbone_image/         # Image-only checkpoints (downloaded) + metrics.json
+├── frontend/                   # React + TypeScript + Tailwind UI
+├── scripts/check_weights.py    # Weight verification
+├── Dockerfile, docker-compose.yml
+└── requirements.txt
 ```
+
+### Research & training history (`backend/mid_fusion_lite/`)
+`backend/mid_fusion_lite/` preserves the **full commit history** from the original research repository (`ISIS_2024_demo`, Apr–Jun 2026) directly on the module files: cross-attention & GMU fusion experiments, tabular feature engineering, 3-stage progressive training, Optuna tuning (`Notebook/experiments/`) and Kaggle training notebooks (`Notebook/`). Model weights were stripped from Git history and are hosted on Kaggle.
 
 ---
 
-## 📥 Hướng dẫn tải và cài đặt Trọng số mô hình (Weights)
+## 🙏 Acknowledgements
+- [ISIC 2024 Challenge](https://www.kaggle.com/competitions/isic-2024-challenge) and the SLICE-3D dataset.
+- [timm](https://github.com/huggingface/pytorch-image-models), [TabM](https://github.com/yandex-research/tabm), FastAPI, React.
 
-Do các file trọng số mô hình `.pt` có kích thước lớn và không được khuyến khích đẩy trực tiếp lên GitHub, bạn cần tải chúng từ tập dữ liệu công khai trên Kaggle và đặt vào đúng vị trí:
-
-1. **Trọng số cho mô hình Kết hợp (Multimodal Fusion - EfficientNet + TabM):**
-   * Tải các file checkpoint từ Kaggle Dataset công khai: [fusion-backbone](https://www.kaggle.com/datasets/khoangdz/fusion-backbone)
-   * Tạo thư mục `backend/models/` (nếu chưa có) và sao chép các file `.pt` này vào đó.
-
-2. **Trọng số cho mô hình chỉ dùng ảnh (Vision Only - EfficientNet-B0):**
-   * Tải các file checkpoint từ Kaggle Dataset công khai: [isic-2024-effb0-backbone](https://www.kaggle.com/datasets/khoangdz/isic-2024-effb0-backbone)
-   * Tạo thư mục `backend/backbone_image/` (nếu chưa có) và sao chép các file `.pt` này vào đó.
-
-*(Lưu ý: Đảm bảo trong mỗi thư mục đều có file `metrics.json` đi kèm tương ứng để backend nhận diện đúng preset).*
-
----
-
-## 🚀 Hướng dẫn khởi chạy dự án
-
-### Cách 1: Khởi chạy nhanh (Dành cho Windows)
-Nếu bạn đang chạy trên hệ điều hành Windows, chỉ cần nhấp đúp vào file:
-```bash
-start_demo.bat
-```
-Script này sẽ tự động khởi tạo backend FastAPI (cổng `8000`) và frontend Vite (cổng `5173`) cùng lúc.
-
----
-
-### Cách 2: Khởi chạy thủ công
-
-#### Bước 1: Khởi động Backend
-1. Di chuyển vào thư mục `backend`:
-   ```bash
-   cd backend
-   ```
-2. Cài đặt các thư viện cần thiết (khuyên dùng môi trường ảo venv):
-   ```bash
-   pip install -r ../requirements.txt
-   ```
-3. Chạy backend FastAPI:
-   ```bash
-   python main.py
-   ```
-   *Backend sẽ lắng nghe tại địa chỉ: `http://127.0.0.1:8000`*
-
-#### Bước 2: Khởi động Frontend
-1. Di chuyển vào thư mục `frontend`:
-   ```bash
-   cd frontend
-   ```
-2. Cài đặt các gói thư viện Node.js:
-   ```bash
-   npm install
-   ```
-3. Chạy môi trường phát triển (Dev server) hoặc biên dịch production:
-   * Chạy dev: `npm run dev`
-   * Biên dịch và cập nhật giao diện vào backend: `npm run build`
-   *Frontend sẽ chạy tại địa chỉ: `http://localhost:5173`*
-
----
-
-## 🔬 Minh họa sử dụng
-1. Truy cập giao diện web tại `http://localhost:5173` (hoặc `http://127.0.0.1:8000` nếu đã chạy build).
-2. Tại phần **Cấu hình mô hình dự đoán**:
-   * Chọn **Mô hình kết hợp** để tải lên cả file metadata (CSV) và ảnh lâm sàng.
-   * Chọn **Mô hình chỉ dùng ảnh** để chỉ cần kéo thả hình ảnh tổn thương da đơn lẻ mà không cần bất kỳ thông tin nào khác.
-3. Bấm **Tiến hành Sàng lọc** để nhận tỉ lệ ác tính, mức độ cảnh báo và bản đồ nhiệt giải thích vị trí tổn thương da.
-
-## Download and verify model artifacts
-
-The checkpoints are intentionally kept outside Git because of their size. With the Kaggle CLI authenticated, download the two public datasets into the expected folders:
-
-```bash
-kaggle datasets download -d khoangdz/fusion-backbone -p backend/models --unzip
-kaggle datasets download -d khoangdz/isic-2024-effb0-backbone -p backend/backbone_image --unzip
-```
-
-Verify the local files before starting the API:
-
-```bash
-python scripts/check_weights.py
-python scripts/check_weights.py --require-preprocessors
-```
-
-The verifier checks all five folds, `metrics.json`, and (optionally) the cached fusion preprocessors. Checkpoints and caches are intentionally ignored by Git; the Kaggle datasets above are the official download sources for this demo.
-
-Install the CLI if needed with `pip install kaggle`, then configure `~/.kaggle/kaggle.json` using your Kaggle account credentials.
+## 📄 License
+[MIT](LICENSE)
