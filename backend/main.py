@@ -3,6 +3,7 @@ import sys
 import shutil
 import uuid
 import json
+import time
 from datetime import datetime
 import pickle
 import zipfile
@@ -58,12 +59,26 @@ from preprocessor_utils import load_or_create_preprocessors
 
 app = FastAPI(title="Skin Lesion Multi-modal Classification API")
 
+SCREENING_THRESHOLD = 0.395996
+HIGH_RISK_THRESHOLD = 0.560058
+MAX_HISTORY_ITEMS = 1000
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_ZIP_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
+SESSION_IMAGE_TTL_SECONDS = 7 * 24 * 60 * 60
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 PREDICTION_HISTORY = []
 
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "CORS_ALLOW_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173",
+        ).split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
     allow_headers=["*"],
     allow_methods=["*"],
@@ -74,15 +89,50 @@ BASE_DIR = Path(__file__).parent
 STATIC_DIR = BASE_DIR / "static"
 TEMPLATES_DIR = BASE_DIR / "templates"
 UPLOADS_DIR = STATIC_DIR / "uploads"
+SESSION_IMAGES_DIR = STATIC_DIR / "session_images"
 
 # Ensure directories exist
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
-# Mount static files
-app.mount("/static/assets", StaticFiles(directory=str(BASE_DIR.parent / "frontend" / "dist" / "assets")), name="frontend_assets")
+# Mount static files. The frontend build is intentionally optional so the API can
+# start in a clean checkout before `npm run build` has been executed.
+FRONTEND_DIST_DIR = BASE_DIR.parent / "frontend" / "dist"
+FRONTEND_ASSETS_DIR = FRONTEND_DIST_DIR / "assets"
+if FRONTEND_ASSETS_DIR.exists():
+    app.mount("/static/assets", StaticFiles(directory=str(FRONTEND_ASSETS_DIR)), name="frontend_assets")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+async def _save_upload(upload: UploadFile, destination: Path, max_bytes: int = MAX_UPLOAD_BYTES) -> int:
+    """Stream an upload to disk while enforcing a hard size limit."""
+    total = 0
+    with destination.open("wb") as target:
+        while chunk := await upload.read(1024 * 1024):
+            total += len(chunk)
+            if total > max_bytes:
+                destination.unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail="Uploaded file is too large.")
+            target.write(chunk)
+    return total
+
+
+def _cleanup_session(session_dir: Optional[Path]) -> None:
+    if session_dir is not None:
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+
+def _cleanup_expired_session_images() -> None:
+    """Remove public previews that outlive the in-memory prediction history."""
+    cutoff = time.time() - SESSION_IMAGE_TTL_SECONDS
+    for session_path in SESSION_IMAGES_DIR.iterdir():
+        try:
+            if session_path.is_dir() and session_path.stat().st_mtime < cutoff:
+                shutil.rmtree(session_path, ignore_errors=True)
+        except OSError:
+            continue
 
 def read_image_from_hdf5(isic_id: str, hdf5_path: Path) -> Optional[np.ndarray]:
     """Load a medical image from the user-provided HDF5 file."""
@@ -248,7 +298,15 @@ def get_available_presets():
 
 @app.get("/")
 async def serve_spa():
-    index_path = BASE_DIR.parent / "frontend" / "dist" / "index.html"
+    index_path = FRONTEND_DIST_DIR / "index.html"
+    if not index_path.exists():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "backend_ready",
+                "message": "Frontend build not found. Run `npm run build` in frontend/.",
+            },
+        )
     response = FileResponse(index_path)
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
@@ -257,10 +315,14 @@ async def serve_spa():
 
 @app.get("/health")
 def health_check():
+    model_ready = any(
+        path.exists() and any(path.glob("*.pt"))
+        for path in (BASE_DIR / "models", BASE_DIR / "backbone_image")
+    )
     return {
         "status": "ok",
         "service": "fastapi-backend",
-        "model_ready": True,
+        "model_ready": model_ready,
         "model_version": "mid_fusion_lite",
     }
 
@@ -276,7 +338,7 @@ async def run_prediction(
     image_files: List[UploadFile] = File(None),
     zip_file: UploadFile = File(None),
     hdf5_file: UploadFile = File(None),
-    model_folder: str = Form("stage3_fusion")
+    model_folder: str = Form("models")
 ):
     """
     Run pipeline prediction:
@@ -287,51 +349,64 @@ async def run_prediction(
     5. Clean up temporary files
     6. Return predictions
     """
-    session_id = str(uuid.uuid4())
-    session_dir = UPLOADS_DIR / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
-    images_dir = session_dir / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    
+    session_dir: Optional[Path] = None
     is_image_only = model_folder == "backbone_image"
+    _cleanup_expired_session_images()
     
     # Validation
+    model_path = Path(model_folder)
+    if (
+        not model_folder
+        or model_path.is_absolute()
+        or model_path.name != model_folder
+        or model_folder in {".", ".."}
+    ):
+        raise HTTPException(status_code=400, detail="Invalid model folder.")
+
     if not is_image_only and (csv_file is None or csv_file.filename == ""):
         raise HTTPException(status_code=400, detail="Mô hình Fusion yêu cầu tải lên file metadata CSV.")
         
     if image_files is None and zip_file is None and hdf5_file is None:
         raise HTTPException(status_code=400, detail="Vui lòng tải lên hình ảnh lâm sàng (ZIP/HDF5/Ảnh).")
             
+    session_id = str(uuid.uuid4())
+    session_dir = UPLOADS_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    images_dir = session_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
     try:
         # Save CSV if not image-only
         if not is_image_only and csv_file is not None and csv_file.filename != "":
             csv_path = session_dir / "input_metadata.csv"
-            with open(csv_path, "wb") as f:
-                f.write(await csv_file.read())
+            await _save_upload(csv_file, csv_path)
             
         # Save HDF5 if provided
         hdf5_path = None
         if hdf5_file is not None and hdf5_file.filename != "":
             hdf5_path = session_dir / "images.hdf5"
-            with open(hdf5_path, "wb") as f:
-                f.write(await hdf5_file.read())
+            await _save_upload(hdf5_file, hdf5_path)
             
         # Save Images from ZIP if provided
         if zip_file is not None and zip_file.filename != "":
             zip_path = session_dir / "images.zip"
-            with open(zip_path, "wb") as f:
-                f.write(await zip_file.read())
+            await _save_upload(zip_file, zip_path)
             
             # Extract ZIP
             with zipfile.ZipFile(zip_path, "r") as zf:
+                if sum(info.file_size for info in zf.infolist()) > MAX_ZIP_UNCOMPRESSED_BYTES:
+                    raise HTTPException(status_code=413, detail="ZIP contents are too large.")
                 for file_info in zf.infolist():
-                    # Avoid directory traversal and hidden files
-                    if "/" in file_info.filename or "\\" in file_info.filename or file_info.filename.startswith("."):
-                        filename = os.path.basename(file_info.filename)
-                        if not filename:
-                            continue
-                    else:
-                        filename = file_info.filename
+                    if file_info.is_dir():
+                        continue
+                    # Flatten paths and accept image files only.
+                    filename = Path(file_info.filename.replace("\\", "/")).name
+                    if (
+                        not filename
+                        or filename.startswith(".")
+                        or Path(filename).suffix.lower() not in ALLOWED_IMAGE_EXTENSIONS
+                    ):
+                        continue
                     
                     target_path = images_dir / filename
                     with zf.open(file_info) as source, open(target_path, "wb") as target:
@@ -341,10 +416,11 @@ async def run_prediction(
         if image_files is not None:
             for img in image_files:
                 if img.filename != "":
-                    # Save image
-                    img_path = images_dir / img.filename
-                    with open(img_path, "wb") as f:
-                        f.write(await img.read())
+                    filename = Path(img.filename).name
+                    if Path(filename).suffix.lower() not in ALLOWED_IMAGE_EXTENSIONS:
+                        raise HTTPException(status_code=400, detail=f"Unsupported image format: {filename}")
+                    img_path = images_dir / filename
+                    await _save_upload(img, img_path)
 
         if is_image_only:
             isic_ids = []
@@ -395,15 +471,7 @@ async def run_prediction(
                 break
                 
         if selected_model_path is None:
-            # Fallback to the first one just in case
-            selected_model_path = outputs_roots[0] if model_folder == "mid_fusion_lite_outputs" else outputs_roots[0] / model_folder
-            
-        if not selected_model_path.exists():
-            # Support absolute paths or exact names if somehow passed
-            if Path(model_folder).exists():
-                selected_model_path = Path(model_folder)
-            else:
-                raise HTTPException(status_code=404, detail=f"Model folder '{model_folder}' not found.")
+            raise HTTPException(status_code=404, detail=f"Model folder '{model_folder}' not found.")
             
         # Read checkpoint files
         checkpoints = list(selected_model_path.glob("*.pt"))
@@ -595,8 +663,15 @@ async def run_prediction(
                 cat_cardinalities=cat_cardinalities,
             )
             
-            # Load state dict
-            state_dict = torch.load(cp, map_location=device)
+            # Load a tensor-only checkpoint. User-controlled paths are rejected
+            # above, and weights_only avoids executing arbitrary pickle payloads.
+            raw_checkpoint = torch.load(cp, map_location=device, weights_only=True)
+            if isinstance(raw_checkpoint, dict) and isinstance(raw_checkpoint.get("state_dict"), dict):
+                state_dict = raw_checkpoint["state_dict"]
+            elif isinstance(raw_checkpoint, dict):
+                state_dict = raw_checkpoint
+            else:
+                raise HTTPException(status_code=500, detail=f"Invalid checkpoint format: {cp.name}")
             # Patch state_dict for backward compatibility with older checkpoints
             if "cross_modal_fusion.image_bottleneck.weight" in state_dict:
                 state_dict["cross_modal_fusion.tab_bottleneck.weight"] = state_dict.pop("cross_modal_fusion.image_bottleneck.weight")
@@ -609,7 +684,11 @@ async def run_prediction(
                 dummy_tabular = torch.zeros(2, x_test.shape[1])
                 _ = model(dummy_images, dummy_tabular)
                 
-            model.load_state_dict(state_dict, strict=False)
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            if len(unexpected_keys) >= len(state_dict):
+                raise HTTPException(status_code=500, detail=f"Checkpoint {cp.name} is incompatible with the model.")
+            if missing_keys:
+                print(f"Checkpoint {cp.name} loaded with {len(missing_keys)} missing keys.")
             model = model.to(device)
             
             # Run predict
@@ -644,7 +723,7 @@ async def run_prediction(
             for ext in [".jpg", ".jpeg", ".png"]:
                 src = images_dir / f"{isic_id}{ext}"
                 if src.exists():
-                    web_dest_dir = STATIC_DIR / "session_images" / session_id
+                    web_dest_dir = SESSION_IMAGES_DIR / session_id
                     web_dest_dir.mkdir(parents=True, exist_ok=True)
                     
                     # Copy original image
@@ -694,10 +773,10 @@ async def run_prediction(
             # Save to history DB
             risk_level = "low"
             risk_text = "Nguy cơ thấp / theo dõi định kỳ"
-            if prob >= 0.560058:
+            if prob >= HIGH_RISK_THRESHOLD:
                 risk_level = "high"
                 risk_text = "Nguy cơ cao / đề nghị sinh thiết ngay"
-            elif prob >= 0.395996:
+            elif prob >= SCREENING_THRESHOLD:
                 risk_level = "medium"
                 risk_text = "Nguy cơ trung bình / nên kiểm tra thêm"
                 
@@ -710,6 +789,7 @@ async def run_prediction(
                 "risk_text": risk_text,
                 "created_at": datetime.now().isoformat()
             })
+            del PREDICTION_HISTORY[MAX_HISTORY_ITEMS:]
 
             results.append({
                 "isic_id": isic_id,
@@ -726,13 +806,8 @@ async def run_prediction(
                 "cam_image_url": cam_web_paths.get(isic_id, None)
             })
             
-        # Clean up temporary folders EXCEPT session_images that frontend needs
-        try:
-            shutil.rmtree(str(images_dir))
-            if (session_dir / "images.zip").exists():
-                (session_dir / "images.zip").unlink()
-        except Exception as e:
-            print(f"Cleanup warning: {e}")
+        # Keep only the public preview/Grad-CAM files; remove uploaded CSV/HDF5/ZIP.
+        _cleanup_session(session_dir)
             
         return JSONResponse({
             "status": "success",
@@ -742,10 +817,12 @@ async def run_prediction(
         
     except HTTPException as he:
         # Re-raise HTTP exceptions
+        _cleanup_session(session_dir)
         raise he
     except Exception as e:
         import traceback
         traceback.print_exc()
+        _cleanup_session(session_dir)
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
 @app.post("/api/initialize")
