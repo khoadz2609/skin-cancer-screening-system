@@ -884,13 +884,30 @@ class MidFusionLiteModel(nn.Module):
                     use_2d_pos_emb=bool(use_2d_pos_emb),
                 )
                 self.bidir_film = nn.Linear(fusion_hidden_dim * 2, effective_tab_dim * 2)
+                self.anchor_tab_gate = nn.Parameter(torch.tensor(1.0))
+                self.anchor_img_gate = nn.Parameter(torch.tensor(0.2))
                 fusion_in_dim = fusion_hidden_dim * 2 + effective_tab_dim
+                if (
+                    uses_tabular
+                    and use_tabm_tabular
+                    and LinearEnsemble is not None
+                    and keep_tabm_ensemble
+                    and self.tabm_k > 1
+                ):
+                    final_proj: nn.Module = LinearEnsemble(
+                        in_features=fusion_hidden_dim,
+                        out_features=1,
+                        bias=True,
+                        k=self.tabm_k,
+                    )
+                else:
+                    final_proj = nn.Linear(fusion_hidden_dim, 1)
                 self.fusion_head = nn.Sequential(
                     nn.Linear(fusion_in_dim, fusion_hidden_dim),
                     nn.LayerNorm(fusion_hidden_dim),
                     nn.GELU(),
                     nn.Dropout(fusion_dropout),
-                    nn.Linear(fusion_hidden_dim, 1),
+                    final_proj,
                 )
             elif self.fusion_mode == "cross_attention":
                 cross_attention_heads = int(
@@ -973,6 +990,10 @@ class MidFusionLiteModel(nn.Module):
         if self.bidir_film is not None:
             nn.init.constant_(self.bidir_film.weight, 0.0)
             nn.init.constant_(self.bidir_film.bias, 0.0)
+        if self.fusion_mode == "bidirectional_co_attention" and self.fusion_head is not None:
+            nn.init.constant_(self.fusion_head[-1].weight, 0.0)
+            if getattr(self.fusion_head[-1], "bias", None) is not None:
+                nn.init.constant_(self.fusion_head[-1].bias, 0.0)
         if getattr(self, 'tab_to_fusion', None) is not None and isinstance(self.tab_to_fusion, nn.Linear):
             self._init_custom_weights(self.tab_to_fusion)
 
@@ -982,7 +1003,7 @@ class MidFusionLiteModel(nn.Module):
             if self.tabular_only_head is not None:
                 if hasattr(self.tabular_only_head, "bias") and self.tabular_only_head.bias is not None:
                     nn.init.constant_(self.tabular_only_head.bias, init_bias)
-            if self.fusion_head is not None:
+            if self.fusion_head is not None and self.fusion_mode != "bidirectional_co_attention":
                 nn.init.constant_(self.fusion_head[-1].bias, init_bias)
 
     def _init_custom_weights(self, module: nn.Module) -> None:
@@ -1318,7 +1339,20 @@ class MidFusionLiteModel(nn.Module):
                     [fused_ctx.unsqueeze(1).expand(-1, K, -1), modulated_tab],
                     dim=-1,
                 )
-                logits = self.fusion_head(fused_members.reshape(-1, fused_members.size(-1))).reshape(B, K)
+                hidden_members = self.fusion_head[:-1](fused_members.reshape(-1, fused_members.size(-1)))
+                last_layer = self.fusion_head[-1]
+                if hasattr(last_layer, "k"):
+                    delta_logits = last_layer(hidden_members.reshape(B, K, -1)).squeeze(-1)
+                else:
+                    delta_logits = last_layer(hidden_members).reshape(B, K)
+
+                tab_anchor = tabular_logits * tab_keep_mask
+                img_anchor = (image_logits * image_keep_mask.squeeze(1)).unsqueeze(1)
+                logits = (
+                    self.anchor_tab_gate * tab_anchor
+                    + self.anchor_img_gate * img_anchor
+                    + delta_logits
+                )
             else:
                 masked_tab = tabular_features * tab_keep_mask
                 modulated_tab = (
@@ -1326,7 +1360,14 @@ class MidFusionLiteModel(nn.Module):
                     + beta * tab_keep_mask
                 )
                 fused_members = torch.cat([fused_ctx, modulated_tab], dim=-1)
-                logits = self.fusion_head(fused_members).squeeze(1)
+                delta_logits = self.fusion_head(fused_members).squeeze(1)
+                tab_anchor = tabular_logits * tab_keep_mask.squeeze(1)
+                img_anchor = image_logits * image_keep_mask.squeeze(1)
+                logits = (
+                    self.anchor_tab_gate * tab_anchor
+                    + self.anchor_img_gate * img_anchor
+                    + delta_logits
+                )
 
             if return_attention and not self.training:
                 return logits, (attn_maps or {})

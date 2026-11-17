@@ -107,8 +107,9 @@ def main() -> None:
         help="Fold tabular feature/bin cache directory to avoid repeating 610-col FE.",
     )
     parser.add_argument("--folds", default="0,1", help="Comma-separated fold indices (default: 0,1).")
-    parser.add_argument("--batch-size", type=int, default=48)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--valid-batch-size", type=int, default=512)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--stage3a-epochs", type=int, default=4)
     parser.add_argument("--stage3b-epochs", type=int, default=6)
     args = parser.parse_args()
@@ -149,6 +150,7 @@ def main() -> None:
         tabular_cache_dir=args.cache_dir,
         output_dir=out_dir,
         train_batch_size=int(args.batch_size),
+        valid_batch_size=int(args.valid_batch_size),
         num_workers=int(args.num_workers),
         stage3_freeze_epochs=int(args.stage3a_epochs),
         stage3_unfreeze_epochs=int(args.stage3b_epochs),
