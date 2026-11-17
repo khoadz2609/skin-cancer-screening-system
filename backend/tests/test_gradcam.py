@@ -45,3 +45,23 @@ def test_gradcam_overlay_returns_image() -> None:
 
     assert isinstance(overlay, Image.Image)
     assert overlay.size == original.size
+
+
+def test_gradcam_overlay_supports_bidirectional_co_attention() -> None:
+    torch.manual_seed(1)
+    kwargs = dict(MODEL_KWARGS)
+    kwargs["fusion_mode"] = "bidirectional_co_attention"
+    kwargs["fusion_num_layers"] = 2
+    model = MidFusionLiteModel(**kwargs)
+    model.eval()
+
+    original = Image.new("RGB", (224, 224))
+    overlay = generate_gradcam_overlay(
+        model,
+        torch.randn(1, 3, 224, 224),
+        torch.randn(1, 610),
+        original,
+    )
+
+    assert isinstance(overlay, Image.Image)
+    assert overlay.size == original.size

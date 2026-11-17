@@ -142,6 +142,143 @@ DEFAULT_CATEGORICAL_COLS = [
     "tbp_lv_location_simple",
 ]
 
+CLINICAL_TOKEN_GROUP_NAMES = (
+    "morphology_shape",
+    "color_pigment",
+    "patient_context",
+    "ugly_duckling",
+    "anatomy_demographics",
+    "interactions_counts",
+    "tabm_global",
+)
+
+
+def build_clinical_feature_groups(
+    numeric_cols: Optional[list[str]],
+    n_numeric: int,
+    categorical_cols: Optional[list[str]] = None,
+) -> dict[str, list[int]]:
+    """Partition numeric feature indices deterministically into 6 clinical semantic groups.
+
+    Preserves TabM's exact input column ordering while enabling multi-token
+    clinical cross-attention without duplicating columns.
+    """
+    group_names = CLINICAL_TOKEN_GROUP_NAMES[:-1]
+    groups: dict[str, list[int]] = {name: [] for name in group_names}
+    if n_numeric <= 0:
+        return groups
+
+    if not numeric_cols or len(numeric_cols) != n_numeric:
+        n_groups = len(group_names)
+        for idx in range(n_numeric):
+            group_idx = (idx * n_groups) // n_numeric
+            groups[group_names[group_idx]].append(idx)
+        return groups
+
+    cat_candidates = (
+        list(categorical_cols) if categorical_cols else list(DEFAULT_CATEGORICAL_COLS)
+    )
+    cat_suffixes = tuple(f"_{c.lower()}" for c in cat_candidates)
+    anatomy_set = {
+        "age_approx",
+        "tbp_lv_x",
+        "tbp_lv_y",
+        "tbp_lv_z",
+        "position_distance_3d",
+        "lesion_orientation_3d",
+        "volume_approximation_3d",
+        "position_norm_3d",
+        "relative_position_x",
+        "relative_position_y",
+        "count_per_patient",
+        "is_single_lesion_patient",
+    }
+    patient_set = {
+        "relative_lesion_size",
+        "tbp_lv_areamm2_patient",
+        "size_age_interaction",
+        "normalized_lesion_size",
+        "age_adjusted_lesion_size",
+        "age_adjusted_complexity",
+        "estimated_growth_rate",
+        "size_age_ratio",
+        "age_size_symmetry_index",
+        "age_normalized_nevi_confidence",
+    }
+    color_keys = (
+        "tbp_lv_a",
+        "tbp_lv_b",
+        "tbp_lv_c",
+        "tbp_lv_h",
+        "tbp_lv_l",
+        "deltaa",
+        "deltab",
+        "deltal",
+        "color",
+        "hue",
+        "luminance",
+        "lab_",
+        "stdl",
+        "contrast",
+    )
+    morph_keys = (
+        "clin_size",
+        "area",
+        "perim",
+        "minoraxis",
+        "eccentricity",
+        "symm",
+        "border",
+        "shape",
+        "visibility",
+        "severity",
+        "comprehensive",
+        "asymmetry",
+        "texture",
+        "density",
+        "malignancy",
+        "aspect_ratio",
+        "complexity",
+        "size_ratio",
+    )
+
+    for idx, col_name in enumerate(numeric_cols):
+        cl = col_name.lower()
+        if (
+            cl.startswith("ud_")
+            or cl == "patient_lof_score"
+            or cl == "tbp_lv_nevi_confidence"
+            or cl.endswith("_patient_site_general_norm")
+            or cl.endswith("_anatomical_zscore")
+        ):
+            groups["ugly_duckling"].append(idx)
+        elif (
+            cl.endswith("_patient_norm")
+            or cl.endswith("_patient_variation")
+            or cl in patient_set
+        ):
+            groups["patient_context"].append(idx)
+        elif (
+            cl.endswith("_count")
+            or cl == "tbp_lv_areamm2_bp"
+            or cl.endswith(cat_suffixes)
+        ):
+            groups["interactions_counts"].append(idx)
+        elif cl in anatomy_set:
+            groups["anatomy_demographics"].append(idx)
+        elif any(k in cl for k in morph_keys) and not any(
+            k in cl for k in ("color", "hue", "luminance")
+        ):
+            groups["morphology_shape"].append(idx)
+        elif any(k in cl for k in color_keys):
+            groups["color_pigment"].append(idx)
+        elif any(k in cl for k in morph_keys):
+            groups["morphology_shape"].append(idx)
+        else:
+            groups["interactions_counts"].append(idx)
+
+    return groups
+
 CONTEXT_NORM_SUFFIXES = [
     "patient_norm",  # Z-score normalized by patient
     "patient_site_general_norm",  # Z-score normalized by anatomical site
@@ -293,6 +430,9 @@ class MidFusionLiteConfig:
     fusion_mode: str = "gmu"
     cross_attention_heads: int = 4
     cross_attention_dropout: float = 0.1
+    fusion_num_layers: int = 2
+    fusion_ffn_mult: int = 2
+    use_2d_pos_emb: bool = True
     tab_dropout: float = 0.3
     fusion_dropout: float = 0.2
     # Total probability that a fusion-training sample drops exactly one modality.
@@ -311,10 +451,15 @@ class MidFusionLiteConfig:
     gradient_clipping_norm: Optional[float] = 2.0
     label_smoothing: float = 0.01
     pos_weight: Optional[float] = None
+    hard_negative_alpha: float = 0.0
+    pauc_loss_weight: float = 0.0
+    pauc_loss_margin: float = 0.2
+    pauc_loss_top_neg_fraction: float = 0.25
     n_bins: int = 48
     d_embedding: int = 32
 
     use_amp: bool = True
+    tta_steps: int = 1
     max_train_steps_per_epoch: Optional[int] = None
     max_valid_steps: Optional[int] = None
     show_predict_progress: bool = True
@@ -322,6 +467,7 @@ class MidFusionLiteConfig:
 
     save_checkpoints: bool = True
     output_dir: str = "./mid_fusion_lite_outputs"
+    tabular_cache_dir: Optional[str] = None
     backbone_weights_path: Optional[str] = None
 
     train_metadata_path: Optional[str] = None
@@ -616,10 +762,57 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             output_dir="./mid_fusion_lite_outputs/image_only_train",
         )
 
+    if normalized == "v2_stage3_bidir":
+        num, cat = build_ablation_columns(True, True, True, True)
+        return MidFusionLiteConfig(
+            preset_name="v2_stage3_bidir",
+            run_mode="fusion",
+            numeric_cols=num,
+            categorical_cols=cat,
+            n_splits=5,
+            fold_indices=None,
+            image_size=224,
+            train_batch_size=48,
+            valid_batch_size=64,
+            epochs=12,
+            warmup_epochs=1,
+            patience=5,
+            lr=2.1e-4,
+            weight_decay=1.32e-4,
+            negative_ratio=5,
+            backbone_name="efficientnet_b0",
+            tab_hidden_dim=256,
+            fusion_hidden_dim=256,
+            fusion_mode="bidirectional_co_attention",
+            cross_attention_heads=4,
+            cross_attention_dropout=0.1,
+            fusion_num_layers=2,
+            fusion_ffn_mult=2,
+            use_2d_pos_emb=True,
+            tabm_k=32,
+            tabm_n_blocks=2,
+            tabm_d_block=256,
+            n_bins=48,
+            d_embedding=32,
+            tab_dropout=0.30,
+            fusion_dropout=0.25,
+            modality_dropout_prob=0.15,
+            aux_loss_image_weight=0.0,
+            aux_loss_tab_weight=0.0,
+            train_image_backbone=True,
+            download_pretrained_backbone=False,
+            stage3_freeze_epochs=4,
+            stage3_unfreeze_epochs=6,
+            stage3a_lr=1e-4,
+            stage3b_lr=1e-5,
+            stage3b_head_lr_mult=5.0,
+            output_dir="./mid_fusion_lite_outputs/v2_stage3_bidir",
+        )
+
     if normalized != "quick":
         raise ValueError(
             "Preset must be one of: smoke, quick, kaggle_top1_fusion, "
-            "full_lite, image_only_train"
+            "v2_stage3_bidir, full_lite, image_only_train"
         )
 
     return MidFusionLiteConfig(

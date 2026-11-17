@@ -212,11 +212,18 @@ class HDF5ImageTabularDataset(Dataset):
 
 class EpochRandomUndersampler(Sampler):
     """
-    Custom PyTorch Sampler that dynamically draws a new random subset of negative
-    indices at the start of every epoch, ensuring the model sees a varied negative
-    distribution over time without replacement within a single epoch.
+    Custom PyTorch Sampler that dynamically draws a new subset of negative indices
+    at the start of every epoch without replacement within the epoch, with optional
+    hardness-weighted negative sampling.
     """
-    def __init__(self, targets: np.ndarray, negative_ratio: float, seed: int):
+    def __init__(
+        self,
+        targets: np.ndarray,
+        negative_ratio: float,
+        seed: int,
+        hard_negative_weights: np.ndarray | None = None,
+        hard_negative_alpha: float = 0.0,
+    ):
         labels = np.asarray(targets, dtype=np.int64)
         self.pos_idx = np.where(labels == 1)[0].tolist()
         self.neg_idx = np.where(labels == 0)[0].tolist()
@@ -228,6 +235,18 @@ class EpochRandomUndersampler(Sampler):
         self.base_seed = seed
         self.epoch = 0
 
+        self.neg_probs: np.ndarray | None = None
+        alpha = float(np.clip(hard_negative_alpha, 0.0, 1.0))
+        if hard_negative_weights is not None and alpha > 0.0 and len(self.neg_idx) > 0:
+            raw_w = np.asarray(hard_negative_weights, dtype=np.float64)[self.neg_idx]
+            raw_w = np.nan_to_num(np.maximum(raw_w, 0.0), nan=0.0, posinf=0.0, neginf=0.0)
+            w_sum = float(raw_w.sum())
+            if w_sum > 0.0:
+                p_hard = raw_w / w_sum
+                p_uniform = np.full(len(self.neg_idx), 1.0 / len(self.neg_idx), dtype=np.float64)
+                probs = (1.0 - alpha) * p_uniform + alpha * p_hard
+                self.neg_probs = probs / probs.sum()
+
     def __iter__(self):
         # We vary the seed per epoch to ensure different samples
         rng = np.random.default_rng(self.base_seed + self.epoch)
@@ -236,7 +255,12 @@ class EpochRandomUndersampler(Sampler):
         if self.n_pos == 0 or len(self.neg_idx) == 0:
             return iter([])
 
-        sampled_neg_idx = rng.choice(self.neg_idx, size=self.n_neg_sampled, replace=False).tolist()
+        sampled_neg_idx = rng.choice(
+            self.neg_idx,
+            size=self.n_neg_sampled,
+            replace=False,
+            p=self.neg_probs,
+        ).tolist()
         
         keep_idx = self.pos_idx + sampled_neg_idx
         rng.shuffle(keep_idx)
@@ -253,9 +277,16 @@ def make_balanced_sampler(
     negative_ratio: float,
     seed: int,
     hard_negative_weights: np.ndarray | None = None,
+    hard_negative_alpha: float = 0.0,
 ) -> Sampler | None:
     """Returns an EpochRandomUndersampler for dynamically resampling negative class."""
-    sampler = EpochRandomUndersampler(targets, negative_ratio, seed)
+    sampler = EpochRandomUndersampler(
+        targets=targets,
+        negative_ratio=negative_ratio,
+        seed=seed,
+        hard_negative_weights=hard_negative_weights,
+        hard_negative_alpha=hard_negative_alpha,
+    )
     if len(sampler) == 0:
         return None
     return sampler
