@@ -95,9 +95,10 @@ class SmoothPAUCLoss(nn.Module):
 
 
 def _extract_probs_from_logits(logits: torch.Tensor) -> torch.Tensor:
-    if isinstance(logits, torch.Tensor) and logits.ndim == 2:
-        return torch.sigmoid(logits).mean(dim=1)
-    return torch.sigmoid(logits)
+    logits_f = logits.float()
+    if isinstance(logits_f, torch.Tensor) and logits_f.ndim == 2:
+        return torch.sigmoid(logits_f).mean(dim=1)
+    return torch.sigmoid(logits_f)
 
 
 def train_one_epoch(
@@ -222,8 +223,8 @@ def evaluate(
                 loss = criterion(logits, y)
                 prob = torch.sigmoid(logits)
 
-        preds.append(prob.detach().cpu().numpy())
-        targets.append(y.detach().cpu().numpy())
+        preds.append(prob.float().detach().cpu().numpy())
+        targets.append(y.float().detach().cpu().numpy())
 
         batch_size = y.size(0)
         total_loss += float(loss.detach().item()) * batch_size
@@ -295,7 +296,7 @@ def predict_loader(
             prob_sum = view_prob if prob_sum is None else (prob_sum + view_prob)
 
         prob = prob_sum / float(len(views))
-        predictions.append(prob.detach().cpu().numpy())
+        predictions.append(prob.float().detach().cpu().numpy())
 
         if progress_name and log_interval > 0:
             if step == 1 or step % log_interval == 0 or step == total_steps:
