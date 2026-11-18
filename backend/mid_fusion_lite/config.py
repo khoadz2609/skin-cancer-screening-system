@@ -803,8 +803,8 @@ def get_preset_config(name: str = "quick") -> MidFusionLiteConfig:
             download_pretrained_backbone=False,
             stage3_freeze_epochs=3,
             stage3_unfreeze_epochs=6,
-            stage3a_lr=2.0e-4,
-            stage3b_lr=2.0e-5,
+            stage3a_lr=2.1e-4,
+            stage3b_lr=2.1e-5,
             stage3b_head_lr_mult=5.0,
             output_dir="./mid_fusion_lite_outputs/v2_stage3_bidir",
         )
