@@ -308,6 +308,9 @@ class BidirectionalAttentionTests(unittest.TestCase):
         torch.testing.assert_close(fusion_logits, changed_logits)
         fusion_logits.sum().backward()
         self.assertIsNotNone(model.bidir_film.weight.grad)
+        self.assertGreater(float(model.bidir_film.weight.grad.abs().sum()), 0.0)
+        self.assertIsNotNone(model.tab_tokenizer.num_feat_proj.weight.grad)
+        self.assertGreater(float(model.tab_tokenizer.num_feat_proj.weight.grad.abs().sum()), 0.0)
 
 
 class SamplingLossAndPipelineTests(unittest.TestCase):

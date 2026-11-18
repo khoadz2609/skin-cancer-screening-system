@@ -799,6 +799,11 @@ def _run_stage3_fusion(
         p.requires_grad = False
     for p in model.image_encoder.parameters():
         p.requires_grad = False
+    if config.fusion_mode == "bidirectional_co_attention":
+        for branch_mod in (model.image_head, model.image_only_head, model.tabular_only_head):
+            if branch_mod is not None:
+                for p in branch_mod.parameters():
+                    p.requires_grad = False
 
     _stage3a_lr = config.stage3a_lr if config.stage3a_lr is not None else config.lr
     fusion_params = [p for p in model.parameters() if p.requires_grad]
@@ -853,6 +858,10 @@ def _run_stage3_fusion(
     print(f"\n  [Stage 3B] Unfreeze encoders, joint fine-tuning (epochs={config.stage3_unfreeze_epochs})...")
     for p in model.tabular_encoder.parameters():
         p.requires_grad = True
+    for branch_mod in (model.image_head, model.image_only_head, model.tabular_only_head):
+        if branch_mod is not None:
+            for p in branch_mod.parameters():
+                p.requires_grad = True
     if config.train_image_backbone:
         for p in model.image_encoder.parameters():
             p.requires_grad = True
